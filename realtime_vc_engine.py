@@ -450,10 +450,10 @@ class RealtimeVCEngine:
 
     def start_stream(self):
         if not self.flag_vc:
-            self._prepare_buffers()
-            self.flag_vc = True
-            
-            # Set devices in sd
+            # Select the devices BEFORE preparing buffers: _prepare_buffers sizes
+            # everything from get_device_samplerate()/get_device_channels(), which
+            # read sd.default.device. Preparing first would build the buffers from
+            # whatever device was previously selected.
             if self.config.sg_input_device and self.config.sg_output_device:
                  try:
                     # Guard the host API lookup: a stale config (e.g. a Windows
@@ -485,6 +485,9 @@ class RealtimeVCEngine:
                         print("Selected input/output device not found; using system default devices.")
                  except Exception as e:
                      print(f"Error setting devices: {e}")
+
+            self._prepare_buffers()
+            self.flag_vc = True
 
             if "WASAPI" in self.config.sg_hostapi and self.config.wasapi_exclusive:
                 extra_settings = sd.WasapiSettings(exclusive=True)

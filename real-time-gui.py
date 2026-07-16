@@ -440,7 +440,12 @@ class GUI:
                 # Pass the function mode to engine
                 self.engine.set_config(function=event)
                 
-            elif event == "stop_vc" or event != "start_vc":
+            elif event == "stop_vc":
+                # Only an explicit stop stops the stream. This used to be a
+                # catch-all (`or event != "start_vc"`), so touching any other
+                # control - including a settings slider - killed the conversion.
+                # Settings that need new buffers are applied on the next start;
+                # reloading devices stops the stream inside update_devices anyway.
                 self.engine.stop_stream()
                 self.publish_audio_delay(0.0)  # tell the video process audio is idle
 
