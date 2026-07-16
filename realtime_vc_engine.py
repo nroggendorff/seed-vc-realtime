@@ -559,9 +559,13 @@ class RealtimeVCEngine:
             else:
                 extra_settings = None
                 
+            # 20ms, deliberately decoupled from the model hop (block_frame). PortAudio
+            # buffers about one blocksize on each side, so tying this to the hop cost
+            # 2*block_time of pure latency. The callback only memcpys now, so the
+            # blocksize no longer has to be large enough to infer in.
             self.stream = sd.Stream(
                 callback=self._audio_callback,
-                blocksize=self.block_frame,
+                blocksize=self.zc,
                 samplerate=self.config.samplerate,
                 channels=self.config.channels,
                 dtype="float32",
