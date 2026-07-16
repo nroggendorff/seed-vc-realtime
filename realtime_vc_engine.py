@@ -4,6 +4,7 @@ import shutil
 import time
 import json
 import threading
+import traceback
 import warnings
 import yaml
 import re
@@ -848,7 +849,21 @@ class RealtimeVCEngine:
                 if block is None:
                     break
                 started = time.perf_counter()
-                self._push_output(self._process_block(block))
+                try:
+                    converted = self._process_block(block)
+                except Exception:
+                    # Same idea as the guard around _custom_infer: log it, emit
+                    # silence for this block, carry on. Letting it escape would end
+                    # the worker, and nothing would notice - the callback has no way
+                    # to tell that its producer is gone, so the stream would run on
+                    # emitting silence for good. Print the traceback rather than
+                    # just the message: this covers the whole pipeline, so the line
+                    # it died on is the part worth having.
+                    if time.time() - self.last_error_print_time > 1.0:
+                        traceback.print_exc()
+                        self.last_error_print_time = time.time()
+                    converted = np.zeros(self.block_frame, dtype=np.float32)
+                self._push_output(converted)
                 self._infer_time = time.perf_counter() - started
 
     def _process_block(self, indata):
