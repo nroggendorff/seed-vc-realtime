@@ -1,6 +1,5 @@
 import os
 import sys
-import struct
 import shutil
 import time
 import json
@@ -15,7 +14,6 @@ import torchaudio.compliance.kaldi as kaldi
 import torchaudio.transforms as tat
 import sounddevice as sd
 import librosa
-from multiprocessing import shared_memory
 from audio_modules.commons import str2bool, recursive_munch, build_model, load_checkpoint
 
 # Add current directory to path for imports
@@ -30,6 +28,15 @@ from funasr import AutoModel
 
 # Suppress warnings
 warnings.simplefilter("ignore")
+
+# Any capture->playback span beyond this is not a real latency, it means the host
+# API gave us unusable timestamps (see _measure_latency).
+MAX_PLAUSIBLE_LATENCY_S = 5.0
+
+# FSMN-VAD needs at least this much audio per call. Below it the LFR window yields
+# zero frames and the model raises "mat1 and mat2 shapes cannot be multiplied
+# (1x0 and 400x140)". Measured: 40ms fails, 60ms works.
+MIN_VAD_CHUNK_MS = 60
 
 class RealtimeVCConfig:
     def __init__(self):
@@ -66,8 +73,10 @@ class RealtimeVCEngine:
         # Runtime state
         self.flag_vc = False
         self.stream = None
-        self.shm = None
-        self.delay_queue = []
+        self.delay_time = 0.0
+        self.measured_delay_time = 0.0  # end-to-end latency (s) that drives A/V sync
+        self._hw_latency = 0.0          # input+output hardware latency, for the fallback estimate
+        self._measured_logged = False
         self.last_error_print_time = 0
         
         # Audio processing state
@@ -77,21 +86,17 @@ class RealtimeVCEngine:
         self.reference_wav_name = ""
         self.prompt_len = 3
         self.ce_dit_difference = 2.0
+
+        # Geometry params the current buffers were built from; set by _prepare_buffers.
+        self.active_extra_time_ce = self.config.extra_time_ce
+        self.active_extra_time = self.config.extra_time
+        self.active_extra_time_right = self.config.extra_time_right
         
         # Load models
         print(f"Loading models on {self.device}...")
         self.model_set = self._load_models(args)
         self.vad_model = AutoModel(model="fsmn-vad", model_revision="v2.0.4", disable_pbar=True, log_level="ERROR", disable_update=True)
         
-        # Shared Memory
-        shm_name = os.environ.get("RAS_SHARED_MEM_NAME")
-        if shm_name:
-            try:
-                self.shm = shared_memory.SharedMemory(name=shm_name)
-                print(f"Connected to Shared Memory: {shm_name}")
-            except Exception as e:
-                print(f"Failed to connect to Shared Memory: {e}")
-
         # Devices
         self.hostapis = []
         self.input_devices = []
@@ -101,7 +106,10 @@ class RealtimeVCEngine:
         self.update_devices()
         
         # Callbacks
-        self.on_perf_update = None # Callback function(infer_time, delay_time)
+        # Reporting hook only: the engine never applies A/V sync policy itself, it
+        # just reports its own timings. The host app (launcher) owns all sync.
+        # Signature: on_perf_update(infer_time, delay_time, measured_delay_time)
+        self.on_perf_update = None
 
     def _get_device(self, gpu_id):
         cuda_target = f"cuda:{gpu_id}" if gpu_id else "cuda"
@@ -318,6 +326,34 @@ class RealtimeVCEngine:
             if d["max_output_channels"] > 0 and d["hostapi_name"] == hostapi_name
         ]
 
+        # Which device this host API considers the default. Callers should prefer
+        # these over input_devices[0]/output_devices[0]: ALSA enumerates raw hw:
+        # devices first, so the first output is typically the GPU's HDMI/DisplayPort
+        # audio (the monitor), while the device the user actually configured
+        # ('default'/'pipewire') sorts last.
+        self.default_input_device = ""
+        self.default_output_device = ""
+        for hostapi in hostapis:
+            if hostapi["name"] != hostapi_name:
+                continue
+            for kind, pool in (("input", self.input_devices), ("output", self.output_devices)):
+                idx = hostapi.get(f"default_{kind}_device", -1)
+                if idx is None or idx < 0:
+                    continue
+                name = devices[idx]["name"]
+                if name in pool:
+                    setattr(self, f"default_{kind}_device", name)
+            break
+
+    def preferred_device(self, kind):
+        """Best default choice for 'input'/'output': the host API default, else the
+        first enumerated device, else ''."""
+        pool = self.input_devices if kind == "input" else self.output_devices
+        default = self.default_input_device if kind == "input" else self.default_output_device
+        if default:
+            return default
+        return pool[0] if pool else ""
+
     def get_device_samplerate(self):
         return int(sd.query_devices(device=sd.default.device[0])["default_samplerate"])
 
@@ -341,9 +377,9 @@ class RealtimeVCEngine:
         # Initialize variables based on current config
         if self.device.type == "mps":
             torch.mps.empty_cache()
-        else:
+        elif self.device.type == "cuda":
             torch.cuda.empty_cache()
-            
+
         self.reference_wav, _ = librosa.load(
             self.config.reference_audio_path, sr=self.model_set[-1]["sampling_rate"]
         )
@@ -362,7 +398,16 @@ class RealtimeVCEngine:
         self.sola_search_frame = self.zc
         self.extra_frame = int(np.round(self.config.extra_time_ce * self.config.samplerate / self.zc)) * self.zc
         self.extra_frame_right = int(np.round(self.config.extra_time_right * self.config.samplerate / self.zc)) * self.zc
-        
+
+        # Snapshot the params the buffers above were sized from. The streaming path
+        # must keep using these even if the user drags a slider mid-stream, or the
+        # config would disagree with the buffer geometry and the slicing would go
+        # out of step. Slider changes take effect on the next start_stream().
+        self.active_extra_time_ce = self.config.extra_time_ce
+        self.active_extra_time = self.config.extra_time
+        self.active_extra_time_right = self.config.extra_time_right
+
+
         self.input_wav = torch.zeros(
             self.extra_frame + self.crossfade_frame + self.sola_search_frame + self.block_frame + self.extra_frame_right,
             device=self.device, dtype=torch.float32
@@ -391,7 +436,11 @@ class RealtimeVCEngine:
 
         # VAD state
         self.vad_cache = {}
-        self.vad_chunk_size = min(500, 1000 * self.config.block_time)
+        # Keep the VAD chunk within what FSMN-VAD can handle, independent of
+        # block_time: the slider goes down to 0.04s, which is below the model's
+        # minimum. _audio_callback accumulates audio to fill exactly this much.
+        self.vad_chunk_size = min(500, max(MIN_VAD_CHUNK_MS, 1000 * self.config.block_time))
+        self.vad_pending = np.array([], dtype=np.float32)
         self.vad_speech_detected = False
         self.vad_pos_start = False
         self.last_vad_time = 0
@@ -405,21 +454,35 @@ class RealtimeVCEngine:
             self.flag_vc = True
             
             # Set devices in sd
-            if self.config.sg_hostapi and self.config.sg_input_device and self.config.sg_output_device:
+            if self.config.sg_input_device and self.config.sg_output_device:
                  try:
-                    hostapi_idx = [h for h in sd.query_hostapis() if h['name'] == self.config.sg_hostapi][0]['index']
+                    # Guard the host API lookup: a stale config (e.g. a Windows
+                    # "MME"/"Windows WASAPI" value loaded on Linux) won't match any
+                    # current host API. Instead of crashing, fall back to matching
+                    # the device names across all host APIs.
+                    # NOTE: query_hostapis() dicts have no 'index' key - a host API's
+                    # index is simply its position in the list.
+                    hostapi_idx = next(
+                        (i for i, h in enumerate(sd.query_hostapis()) if h['name'] == self.config.sg_hostapi),
+                        None,
+                    )
+                    if hostapi_idx is None:
+                        print(f"Host API '{self.config.sg_hostapi}' not found; matching devices by name across all host APIs.")
                     # Find device indices
                     input_idx = -1
                     output_idx = -1
                     for d in sd.query_devices():
-                         if d['hostapi'] == hostapi_idx:
-                             if d['name'] == self.config.sg_input_device and d['max_input_channels'] > 0:
-                                 input_idx = d['index']
-                             if d['name'] == self.config.sg_output_device and d['max_output_channels'] > 0:
-                                 output_idx = d['index']
-                    
+                         if hostapi_idx is not None and d['hostapi'] != hostapi_idx:
+                             continue
+                         if d['name'] == self.config.sg_input_device and d['max_input_channels'] > 0:
+                             input_idx = d['index']
+                         if d['name'] == self.config.sg_output_device and d['max_output_channels'] > 0:
+                             output_idx = d['index']
+
                     if input_idx >= 0 and output_idx >= 0:
                         sd.default.device = (input_idx, output_idx)
+                    else:
+                        print("Selected input/output device not found; using system default devices.")
                  except Exception as e:
                      print(f"Error setting devices: {e}")
 
@@ -434,21 +497,40 @@ class RealtimeVCEngine:
                 samplerate=self.config.samplerate,
                 channels=self.config.channels,
                 dtype="float32",
+                latency="low",
                 extra_settings=extra_settings,
             )
+
+            # Compute delay_time BEFORE starting the stream, so the audio
+            # callback (which reads self.delay_time) never sees a stale/undefined
+            # value. self.stream.latency is available once the stream is opened.
+            input_latency = self.stream.latency[0]
+            output_latency = self.stream.latency[1]
+            # Duplex buffering only: in_lat/out_lat each already cover ~one block,
+            # so this must NOT add block_time again. Used as the fallback latency
+            # when the host API has no usable timestamps.
+            self._hw_latency = input_latency + output_latency
+            self.delay_time = (
+                input_latency + output_latency
+                + self.config.block_time
+                + self.config.crossfade_time
+                + 0.01
+                + 0.5
+            )
+            print(f"Audio Delay Calculated: {self.delay_time*1000:.2f}ms")
+            # Breakdown to diagnose where the latency comes from. in_lat/out_lat
+            # is the PortAudio hardware buffering (dominated by 'high' latency
+            # mode on Linux/Pulse); the algorithmic look-ahead (extra_time_right)
+            # is REAL perceived latency but is NOT part of delay_time.
+            print(
+                f"  [breakdown] in_lat={input_latency*1000:.1f}ms "
+                f"out_lat={output_latency*1000:.1f}ms "
+                f"block={self.config.block_time*1000:.1f}ms "
+                f"crossfade={self.config.crossfade_time*1000:.1f}ms fixed=510.0ms | "
+                f"look-ahead extra_time_right={self.config.extra_time_right*1000:.1f}ms (not in delay_time)"
+            )
+
             self.stream.start()
-            
-            if self.stream:
-                input_latency = self.stream.latency[0]
-                output_latency = self.stream.latency[1]
-                self.delay_time = (
-                    input_latency + output_latency
-                    + self.config.block_time
-                    + self.config.crossfade_time
-                    + 0.01
-                    + 0.5 
-                )
-                print(f"Audio Delay Calculated: {self.delay_time*1000:.2f}ms")
 
     def stop_stream(self):
         if self.flag_vc:
@@ -457,13 +539,10 @@ class RealtimeVCEngine:
                 self.stream.abort()
                 self.stream.close()
                 self.stream = None
-            
-            if self.shm:
-                try:
-                    self.shm.buf[0:8] = struct.pack('d', 0.0)
-                    print("Audio delay reset to 0.0 in SHM")
-                except Exception as e:
-                    print(f"Failed to reset SHM: {e}")
+
+            # Latency is meaningless while stopped; consumers read 0 as "audio idle".
+            self.measured_delay_time = 0.0
+            self._measured_logged = False
 
     @torch.no_grad()
     def _custom_infer(self, input_wav_res):
@@ -471,15 +550,22 @@ class RealtimeVCEngine:
         sr = mel_fn_args["sampling_rate"]
         hop_length = mel_fn_args["hop_size"]
         
-        cd_difference = self.config.extra_time_ce - self.config.extra_time
+        cd_difference = self.active_extra_time_ce - self.active_extra_time
         max_prompt_length = self.config.max_prompt_length # assumed available in config
 
         if self.ce_dit_difference != cd_difference:
             self.ce_dit_difference = cd_difference
         
-        if self.prompt_condition is None or self.reference_wav_name != self.config.reference_audio_path or self.prompt_len != max_prompt_length:
+        reference_changed = self.reference_wav_name != self.config.reference_audio_path
+        if self.prompt_condition is None or reference_changed or self.prompt_len != max_prompt_length:
             self.prompt_len = max_prompt_length
             print(f"Setting max prompt length to {max_prompt_length} seconds.")
+            if reference_changed:
+                # The samples must follow the path, not just the name: _prepare_buffers
+                # only loads the reference once, so without this a mid-stream switch
+                # would rebuild the prompt from the PREVIOUS file's audio and keep
+                # converting to the old voice.
+                self.reference_wav, _ = librosa.load(self.config.reference_audio_path, sr=sr)
             # Re-process reference wav
             ref_wav_slice = self.reference_wav[:int(sr * self.prompt_len)]
             reference_wav_tensor = torch.from_numpy(ref_wav_slice).to(self.device)
@@ -530,14 +616,53 @@ class RealtimeVCEngine:
         output = vc_wave[-output_len - tail_len: -tail_len]
         return output
 
+    def _measure_latency(self, times):
+        """Real capture->playback latency (s) from PortAudio timestamps, or None.
+
+        Returns None when the host API does not supply usable timestamps: Windows
+        MME/DirectSound report inputBufferAdcTime == 0, which would otherwise make
+        the span come out as PortAudio's absolute clock (i.e. wildly wrong).
+        """
+        adc = times.inputBufferAdcTime
+        dac = times.outputBufferDacTime
+        if adc <= 0 or dac <= 0:
+            return None
+        span = dac - adc
+        if not 0.0 < span < MAX_PLAUSIBLE_LATENCY_S:
+            return None
+        return span + self.active_extra_time_right
+
     def _audio_callback(self, indata, outdata, frames, times, status):
         start_time = time.perf_counter()
+
+        # End-to-end audio latency driving A/V sync. Prefer the real measurement
+        # from PortAudio timestamps; fall back to the hardware-latency estimate
+        # where the host API cannot provide them.
+        measured = self._measure_latency(times)
+        if measured is None:
+            self.measured_delay_time = self._hw_latency + self.active_extra_time_right
+            if not self._measured_logged:
+                print(
+                    f"  [measured] host API gives no usable timestamps; falling back to estimate "
+                    f"= {self.measured_delay_time*1000:.1f}ms. A/V sync may need the Sync Offset "
+                    f"slider. On Windows, prefer the 'Windows WASAPI' host API over 'MME'."
+                )
+                self._measured_logged = True
+        else:
+            self.measured_delay_time = measured
+            if not self._measured_logged:
+                print(
+                    f"  [measured] real audio latency = {self.measured_delay_time*1000:.1f}ms "
+                    f"(vs estimated delay_time = {self.delay_time*1000:.1f}ms)"
+                )
+                self._measured_logged = True
+
         indata = librosa.to_mono(indata.T)
         
         # Synchronization setup
         if self.device.type == "mps":
              torch.mps.synchronize()
-        else:
+        elif self.device.type == "cuda":
              torch.cuda.synchronize()
 
         # VAD Processing
@@ -550,21 +675,31 @@ class RealtimeVCEngine:
                 self.vad_model.generate(input=warmup_audio, cache=self.vad_cache, is_final=False, chunk_size=self.vad_chunk_size)
             self.last_vad_reset_time = time.time()
 
-        res = self.vad_model.generate(input=indata_16k, cache=self.vad_cache, is_final=False, chunk_size=self.vad_chunk_size)
         self.vad_input_history = np.concatenate((self.vad_input_history, indata_16k))
         if len(self.vad_input_history) > 16000 * 6:
             self.vad_input_history = self.vad_input_history[-16000 * 6:]
-            
-        res_value = res[0]["value"]
-        
-        for segment in res_value:
-            s_time, e_time = segment
-            if s_time != -1:
-                self.vad_pos_start = True
-            if e_time != -1:
-                self.vad_pos_start = False
-                self.last_vad_end_time = time.time()
-        
+
+        # Feed the VAD in fixed chunks rather than passing the block straight
+        # through: a block smaller than the model's minimum makes it raise, and a
+        # block larger than vad_chunk_size would disagree with the chunk_size we
+        # declare. Accumulate, then consume whole chunks.
+        self.vad_pending = np.concatenate((self.vad_pending, indata_16k))
+        chunk_samples = int(self.vad_chunk_size * 16)  # 16 samples per ms at 16 kHz
+        while len(self.vad_pending) >= chunk_samples:
+            vad_chunk = self.vad_pending[:chunk_samples]
+            self.vad_pending = self.vad_pending[chunk_samples:]
+            res = self.vad_model.generate(
+                input=vad_chunk, cache=self.vad_cache, is_final=False, chunk_size=self.vad_chunk_size
+            )
+            for segment in res[0]["value"]:
+                s_time, e_time = segment
+                if s_time != -1:
+                    self.vad_pos_start = True
+                if e_time != -1:
+                    self.vad_pos_start = False
+                    self.last_vad_end_time = time.time()
+
+
         if self.vad_pos_start:
             self.vad_speech_detected = True
         else:
@@ -591,7 +726,7 @@ class RealtimeVCEngine:
         if self.config.function == "im":
             # Input monitoring mode: directly pass through the input audio
             infer_wav = self.input_wav[self.extra_frame : self.extra_frame + self.block_frame + self.sola_buffer_frame + self.sola_search_frame].clone()
-        elif self.config.extra_time_ce - self.config.extra_time < 0:
+        elif self.active_extra_time_ce - self.active_extra_time < 0:
              if time.time() - self.last_error_print_time > 1.0:
                  print("Error: Content encoder extra context must be greater than DiT extra context!")
                  self.last_error_print_time = time.time()
@@ -645,31 +780,7 @@ class RealtimeVCEngine:
         
         total_time = time.perf_counter() - start_time
         if self.on_perf_update:
-            self.on_perf_update(total_time, self.delay_time)
+            self.on_perf_update(total_time, self.delay_time, self.measured_delay_time)
 
-        # Output handling with Shared Memory sync
-        if self.shm:
-            try:
-                current_delay_ms = self.delay_time * 1000
-                self.shm.buf[0:8] = struct.pack('d', current_delay_ms)
-                target_delay_ms = struct.unpack('d', self.shm.buf[8:16])[0]
-                extra_delay_s = max(0, (target_delay_ms - current_delay_ms) / 1000.0)
-                
-                self.delay_queue.append((time.perf_counter(), final_output))
-                if self.delay_queue:
-                    ts, data = self.delay_queue[0]
-                    if time.perf_counter() - ts >= extra_delay_s:
-                        outdata[:] = data
-                        self.delay_queue.pop(0)
-                    else:
-                        outdata[:] = np.zeros_like(outdata)
-                else:
-                     outdata[:] = np.zeros_like(outdata)
-            except Exception as e:
-                if time.time() - self.last_error_print_time > 1.0:
-                    print(f"SHM Error: {e}")
-                    self.last_error_print_time = time.time()
-                outdata[:] = final_output
-        else:
-            outdata[:] = final_output
+        outdata[:] = final_output
 

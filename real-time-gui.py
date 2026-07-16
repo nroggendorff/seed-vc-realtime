@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import struct
 import warnings
 import re
 import argparse
@@ -9,6 +10,7 @@ import numpy as np
 import torch
 import FreeSimpleGUI as sg
 from multiprocessing import cpu_count
+from multiprocessing import shared_memory
 from dotenv import load_dotenv
 from realtime_vc_engine import RealtimeVCEngine
 from audio_modules.commons import str2bool
@@ -23,6 +25,14 @@ if sys.platform == "darwin":
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
+# Resolve config paths against this script, not the CWD: the launcher may start us
+# from anywhere, and unified_launcher.py restores the CWD to the repo root after
+# initialising the engine.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CONFIG_PATH = os.path.join(SCRIPT_DIR, "configs", "config.json")
+INUSE_CONFIG_DIR = os.path.join(SCRIPT_DIR, "configs", "inuse")
+INUSE_CONFIG_PATH = os.path.join(INUSE_CONFIG_DIR, "config.json")
+
 # Suppress warnings
 warnings.simplefilter("ignore")
 
@@ -35,37 +45,62 @@ def printt(strr, *args):
 class GUI:
     def __init__(self, args) -> None:
         self.engine = RealtimeVCEngine(args)
-        
+
         # Setup callback for performance monitoring
         self.engine.on_perf_update = self.update_perf_stats
         self.last_gui_update = 0
-        
+
         self.function = "vc"
-        
+
+        # Shared memory is the IPC channel for the legacy two-process launcher
+        # (launcher.py): this GUI publishes the measured audio latency so the
+        # separate video process can sync to it. The engine itself stays free of
+        # any sync/IPC concern - it only reports its timings via on_perf_update.
+        self.shm = None
+        shm_name = os.environ.get("RAS_SHARED_MEM_NAME")
+        if shm_name:
+            try:
+                self.shm = shared_memory.SharedMemory(name=shm_name)
+                print(f"Connected to Shared Memory: {shm_name}")
+            except Exception as e:
+                print(f"Failed to connect to Shared Memory: {e}")
+
         # Load initial configuration and devices
         self.update_devices()
         self.launcher()
 
-    def update_perf_stats(self, infer_time, delay_time):
+    def publish_audio_delay(self, delay_seconds):
+        """Publish audio latency to shared memory for the legacy video process."""
+        if not self.shm:
+            return
+        try:
+            self.shm.buf[0:8] = struct.pack('d', delay_seconds * 1000)
+        except Exception as e:
+            print(f"Failed to publish audio delay to SHM: {e}")
+
+    def update_perf_stats(self, infer_time, delay_time, measured_delay_time):
         """Callback to update UI with performance stats"""
+        # Publish every callback (cheap) so the video process tracks latency
+        # promptly; the UI update below stays throttled.
+        self.publish_audio_delay(measured_delay_time)
+
         if time.time() - self.last_gui_update < 0.1:
             return
         self.last_gui_update = time.time()
 
         try:
             self.window["infer_time"].update(int(infer_time * 1000))
-            # Delay time is static usually, but we can update if needed
-            # self.window["delay_time"].update(int(np.round(delay_time * 1000)))
+            self.window["delay_time"].update(int(np.round(measured_delay_time * 1000)))
         except:
             pass
 
     def load(self):
         try:
-            os.makedirs("configs/inuse", exist_ok=True)
-            if not os.path.exists("configs/inuse/config.json"):
+            os.makedirs(INUSE_CONFIG_DIR, exist_ok=True)
+            if not os.path.exists(INUSE_CONFIG_PATH):
                 import shutil
-                shutil.copy("configs/config.json", "configs/inuse/config.json")
-            with open("configs/inuse/config.json", "r") as j:
+                shutil.copy(DEFAULT_CONFIG_PATH, INUSE_CONFIG_PATH)
+            with open(INUSE_CONFIG_PATH, "r") as j:
                 data = json.load(j)
                 data["sr_model"] = data["sr_type"] == "sr_model"
                 data["sr_device"] = data["sr_type"] == "sr_device"
@@ -78,18 +113,15 @@ class GUI:
                     ):
                         self.update_devices()
                         data["sg_hostapi"] = self.engine.hostapis[0]
-                        # Safe fallback
-                        if self.engine.input_devices:
-                             data["sg_input_device"] = self.engine.input_devices[0]
-                        if self.engine.output_devices:
-                             data["sg_output_device"] = self.engine.output_devices[0]
+                        # Safe fallback: the host API default, never devices[0]
+                        # (that is the monitor's HDMI audio on a typical Linux box).
+                        data["sg_input_device"] = self.engine.preferred_device("input")
+                        data["sg_output_device"] = self.engine.preferred_device("output")
                 else:
                     self.update_devices() # Reset to default hostapi
                     data["sg_hostapi"] = self.engine.hostapis[0]
-                    if self.engine.input_devices:
-                         data["sg_input_device"] = self.engine.input_devices[0]
-                    if self.engine.output_devices:
-                         data["sg_output_device"] = self.engine.output_devices[0]
+                    data["sg_input_device"] = self.engine.preferred_device("input")
+                    data["sg_output_device"] = self.engine.preferred_device("output")
         except Exception as e:
             print(f"Error loading config: {e}")
             # Default config creation logic could go here
@@ -341,6 +373,7 @@ class GUI:
             event, values = self.window.read()
             if event == sg.WINDOW_CLOSED:
                 self.engine.stop_stream()
+                self.publish_audio_delay(0.0)  # tell the video process audio is idle
                 exit()
             
             if event == "reload_devices" or event == "sg_hostapi":
@@ -387,7 +420,8 @@ class GUI:
                         "extra_time_right": values["extra_time_right"],
                     }
                     try:
-                        with open("configs/inuse/config.json", "w") as j:
+                        os.makedirs(INUSE_CONFIG_DIR, exist_ok=True)
+                        with open(INUSE_CONFIG_PATH, "w") as j:
                             json.dump(settings, j)
                     except:
                         pass
@@ -408,6 +442,7 @@ class GUI:
                 
             elif event == "stop_vc" or event != "start_vc":
                 self.engine.stop_stream()
+                self.publish_audio_delay(0.0)  # tell the video process audio is idle
 
     def set_values(self, values):
         if len(values["reference_audio_path"].strip()) == 0:

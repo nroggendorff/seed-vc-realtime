@@ -7,7 +7,6 @@ librosa==0.10.2
 huggingface-hub>=0.28.1
 munch==4.0.0
 einops==0.8.0
-descript-audio-codec==1.0.0
 pydub==0.25.1
 transformers==4.46.3
 FreeSimpleGUI==5.1.1
