@@ -3,6 +3,7 @@ import sys
 import shutil
 import time
 import json
+import threading
 import warnings
 import yaml
 import re
@@ -94,6 +95,14 @@ class RealtimeVCEngine:
         self._hostapi_name = ""         # host API actually in use; gates the measurement
         self._measured_logged = False
         self.last_error_print_time = 0
+
+        # The pipeline runs on _worker, not in the audio callback: one slow
+        # inference inside the callback overruns its deadline and drops audio.
+        # The callback only memcpys through the rings below.
+        self._ring_lock = threading.Lock()
+        self._in_ready = threading.Event()
+        self._worker = None
+        self._infer_time = 0.0          # per-block pipeline time (s); worker writes, callback reads
         
         # Audio processing state
         self.prompt_condition = None
@@ -415,6 +424,16 @@ class RealtimeVCEngine:
         self.extra_frame = int(np.round(self.config.extra_time_ce * self.config.samplerate / self.zc)) * self.zc
         self.extra_frame_right = int(np.round(self.config.extra_time_right * self.config.samplerate / self.zc)) * self.zc
 
+        # How far the output ring runs ahead of the input, and thus exactly what the
+        # pipeline adds to the end-to-end latency (see _measure_latency).
+        # The worker cannot run ahead on its own - it can only start a block once
+        # that block's audio has arrived - so this priming is the only thing
+        # absorbing inference jitter, and it costs latency 1:1. One block_frame
+        # covers accumulating the block, a second covers inferring it; a real-time
+        # factor below 1 means inference fits inside the second one.
+        self._prime_frames = 2 * self.block_frame
+        self._prime_time = self._prime_frames / self.config.samplerate
+
         # Snapshot the params the buffers above were sized from. The streaming path
         # must keep using these even if the user drags a slider mid-stream, or the
         # config would disagree with the buffer geometry and the slicing would go
@@ -440,6 +459,25 @@ class RealtimeVCEngine:
         self.skip_head = self.extra_frame // self.zc
         self.skip_tail = self.extra_frame_right // self.zc
         self.return_length = (self.block_frame + self.sola_buffer_frame + self.sola_search_frame) // self.zc
+
+        # Mono PCM rings handing audio between the callback and the worker. Sized at
+        # 4 blocks: the output ring peaks at _prime_frames, so this leaves 2 blocks
+        # of headroom. Priming the output ring is just pointer arithmetic - the ring
+        # is already zeroed, so "write _prime_frames of silence" is a free head start.
+        ring_capacity = 4 * self.block_frame
+        self._in_ring = np.zeros(ring_capacity, dtype=np.float32)
+        self._in_r = 0
+        self._in_w = 0
+        self._in_avail = 0
+        self._out_ring = np.zeros(ring_capacity, dtype=np.float32)
+        self._out_r = 0
+        self._out_w = self._prime_frames
+        self._out_avail = self._prime_frames
+        # Frames the callback had to swallow. The worker drops this many from the
+        # head of what it produces next, which keeps produced == consumed+swallowed
+        # and stops an underrun from permanently growing the latency.
+        self._out_debt = 0
+        self._in_ready.clear()
         
         self.fade_in_window = (torch.sin(0.5 * np.pi * torch.linspace(0.0, 1.0, steps=self.sola_buffer_frame, device=self.device, dtype=torch.float32)) ** 2)
         self.fade_out_window = 1 - self.fade_in_window
@@ -560,15 +598,31 @@ class RealtimeVCEngine:
                 f"look-ahead extra_time_right={self.config.extra_time_right*1000:.1f}ms (not in delay_time)"
             )
 
+            # Worker before stream: it must already be draining the input ring when
+            # the first callback lands. flag_vc is True (its run flag) and the output
+            # ring was primed by _prepare_buffers.
+            self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+            self._worker.start()
+
             self.stream.start()
 
     def stop_stream(self):
         if self.flag_vc:
             self.flag_vc = False
             if self.stream is not None:
+                # abort() is synchronous, so no callback is in flight afterwards.
+                # It must come before the join: it stops the ring's producer and
+                # consumer, so the worker cannot be left waiting on input.
                 self.stream.abort()
                 self.stream.close()
                 self.stream = None
+
+            if self._worker is not None:
+                self._in_ready.set()  # wake it now instead of waiting out the timeout
+                self._worker.join(timeout=5.0)
+                if self._worker.is_alive():
+                    print("Warning: the VC worker did not exit; it may still hold the buffers.")
+                self._worker = None
 
             # Latency is meaningless while stopped; consumers read 0 as "audio idle".
             self.measured_delay_time = 0.0
@@ -653,6 +707,14 @@ class RealtimeVCEngine:
         case the caller falls back to the hardware-latency estimate. Checking the
         numbers alone is not enough: WASAPI and DirectSound both return values that
         look plausible but are far too small, so the host API is checked first.
+
+        dac - adc still covers exactly the hardware leg (ADC -> callback -> DAC).
+        The pipeline sits between those two points and contributes _prime_time: the
+        callback consumes or swallows exactly `frames` per call, so the output ring
+        stays _prime_frames ahead of the input for good. Note that is a constant -
+        the ring's instantaneous occupancy sawtooths by a block as the worker
+        produces in bursts, and publishing that would inject the sawtooth straight
+        into the video delay.
         """
         if self._hostapi_name not in TIMESTAMP_CAPABLE_HOSTAPIS:
             return None
@@ -663,17 +725,20 @@ class RealtimeVCEngine:
         span = dac - adc
         if not 0.0 < span < MAX_PLAUSIBLE_LATENCY_S:
             return None
-        return span + self.active_extra_time_right
+        return span + self._prime_time + self.active_extra_time_right
 
     def _audio_callback(self, indata, outdata, frames, times, status):
-        start_time = time.perf_counter()
+        # Memcpy only. The pipeline runs on _worker: doing it here is what used to
+        # overrun PortAudio's deadline and drop audio whenever inference was slow.
 
         # End-to-end audio latency driving A/V sync. Prefer the real measurement
         # from PortAudio timestamps; fall back to the hardware-latency estimate
         # where the host API cannot provide them.
         measured = self._measure_latency(times)
         if measured is None:
-            self.measured_delay_time = self._hw_latency + self.active_extra_time_right
+            self.measured_delay_time = (
+                self._hw_latency + self._prime_time + self.active_extra_time_right
+            )
             if not self._measured_logged:
                 print(
                     f"  [measured] host API '{self._hostapi_name}' does not implement real "
@@ -691,8 +756,107 @@ class RealtimeVCEngine:
                 )
                 self._measured_logged = True
 
-        indata = librosa.to_mono(indata.T)
-        
+        mono_in = librosa.to_mono(indata.T)
+        with self._ring_lock:
+            overflow = self._in_avail + frames > len(self._in_ring)
+            if not overflow:
+                self._ring_write(self._in_ring, self._in_w, mono_in)
+                self._in_w = (self._in_w + frames) % len(self._in_ring)
+                self._in_avail += frames
+            if self._out_avail >= frames:
+                chunk = self._ring_read(self._out_ring, self._out_r, frames)
+                self._out_r = (self._out_r + frames) % len(self._out_ring)
+                self._out_avail -= frames
+            else:
+                # Swallow the frames that should have played. Emitting silence
+                # without also dropping them would leave produced > consumed for
+                # good, so every underrun would permanently add to the latency -
+                # and drifting latency would break A/V sync.
+                chunk = None
+                self._out_debt += frames
+        self._in_ready.set()
+
+        if chunk is None:
+            outdata[:] = 0
+            self._print_throttled("output underrun: the pipeline is not keeping up")
+        else:
+            outdata[:] = chunk[:, None]
+        if overflow:
+            self._print_throttled("input ring overflow: inference is slower than block_time")
+
+        if self.on_perf_update:
+            self.on_perf_update(self._infer_time, self.delay_time, self.measured_delay_time)
+
+    @staticmethod
+    def _ring_write(ring, w, data):
+        tail = len(ring) - w
+        if len(data) <= tail:
+            ring[w : w + len(data)] = data
+        else:
+            ring[w:] = data[:tail]
+            ring[: len(data) - tail] = data[tail:]
+
+    @staticmethod
+    def _ring_read(ring, r, n):
+        # Must copy: the ring keeps being written behind us.
+        tail = len(ring) - r
+        if n <= tail:
+            return ring[r : r + n].copy()
+        return np.concatenate((ring[r:], ring[: n - tail]))
+
+    def _print_throttled(self, msg):
+        if time.time() - self.last_error_print_time > 1.0:
+            print(msg)
+            self.last_error_print_time = time.time()
+
+    def _pop_input(self):
+        with self._ring_lock:
+            if self._in_avail < self.block_frame:
+                return None
+            block = self._ring_read(self._in_ring, self._in_r, self.block_frame)
+            self._in_r = (self._in_r + self.block_frame) % len(self._in_ring)
+            self._in_avail -= self.block_frame
+        return block
+
+    def _push_output(self, block):
+        with self._ring_lock:
+            dropped = min(self._out_debt, len(block))
+            if dropped:
+                self._out_debt -= dropped
+                block = block[dropped:]
+            if len(block) == 0:
+                return
+            if self._out_avail + len(block) > len(self._out_ring):
+                self._print_throttled("output ring overflow")
+                return
+            self._ring_write(self._out_ring, self._out_w, block)
+            self._out_w = (self._out_w + len(block)) % len(self._out_ring)
+            self._out_avail += len(block)
+
+    def _worker_loop(self):
+        # One worker only: _custom_infer is not reentrant (the DiT KV cache is set
+        # up for batch size 1), and the pipeline is serial anyway - each block's
+        # SOLA crossfade depends on the previous block's tail.
+        while self.flag_vc:
+            # The timeout keeps stop_stream responsive and lets a lost wakeup heal.
+            if not self._in_ready.wait(timeout=0.1):
+                continue
+            self._in_ready.clear()
+            while self.flag_vc:
+                block = self._pop_input()
+                if block is None:
+                    break
+                started = time.perf_counter()
+                self._push_output(self._process_block(block))
+                self._infer_time = time.perf_counter() - started
+
+    def _process_block(self, indata):
+        """Convert exactly block_frame of mono input. Runs on _worker.
+
+        Everything below owns its state outright - input_wav, input_wav_res,
+        sola_buffer and the VAD caches are touched from this thread only, which is
+        why no snapshot or lock is needed around them.
+        """
         # Synchronization setup
         if self.device.type == "mps":
              torch.mps.synchronize()
@@ -807,17 +971,7 @@ class RealtimeVCEngine:
         infer_wav[: self.sola_buffer_frame] += (self.sola_buffer * self.fade_out_window)
         self.sola_buffer[:] = infer_wav[self.block_frame : self.block_frame + self.sola_buffer_frame]
         
-        final_output = (
-            infer_wav[: self.block_frame]
-            .repeat(self.config.channels, 1)
-            .t()
-            .cpu()
-            .numpy()
-        )
-        
-        total_time = time.perf_counter() - start_time
-        if self.on_perf_update:
-            self.on_perf_update(total_time, self.delay_time, self.measured_delay_time)
-
-        outdata[:] = final_output
+        # Mono: the callback broadcasts across channels when it fills outdata, so
+        # there is no point copying every channel back from the device.
+        return infer_wav[: self.block_frame].cpu().numpy()
 
