@@ -461,7 +461,6 @@ class RealtimeVCEngine:
         self.vad_pos_start = False
         self.last_vad_time = 0
         self.last_vad_end_time = 0
-        self.vad_input_history = np.array([], dtype=np.float32)
         self.last_vad_reset_time = time.time()
 
     def start_stream(self):
@@ -703,16 +702,16 @@ class RealtimeVCEngine:
         # VAD Processing
         indata_16k = librosa.resample(indata, orig_sr=self.config.samplerate, target_sr=16000)
         
+        # FSMN-VAD's streaming cache degrades under sustained speech: funasr grows
+        # cache["stats"].scores / data_buf_all by concatenation on every chunk and
+        # only trims them once a segment end is confirmed, which never comes while
+        # someone keeps talking. Resetting periodically bounds that.
+        # No warmup is needed after the reset: vad_pos_start only clears on an
+        # explicit segment end, and funasr cannot report an end before a start on a
+        # fresh cache, so the gate below stays open across the reset.
         if time.time() - self.last_vad_reset_time > 10.0:
             self.vad_cache = {}
-            if len(self.vad_input_history) > 0:
-                warmup_audio = self.vad_input_history[-int(16000 * 1.5):]
-                self.vad_model.generate(input=warmup_audio, cache=self.vad_cache, is_final=False, chunk_size=self.vad_chunk_size)
             self.last_vad_reset_time = time.time()
-
-        self.vad_input_history = np.concatenate((self.vad_input_history, indata_16k))
-        if len(self.vad_input_history) > 16000 * 6:
-            self.vad_input_history = self.vad_input_history[-16000 * 6:]
 
         # Feed the VAD in fixed chunks rather than passing the block straight
         # through: a block smaller than the model's minimum makes it raise, and a
@@ -743,6 +742,9 @@ class RealtimeVCEngine:
 
         if not self.vad_pos_start and not self.vad_speech_detected:
             self.vad_cache = {}
+            # The cache is already fresh, so hold off the periodic reset above -
+            # otherwise its timer keeps ageing through silence and fires for nothing.
+            self.last_vad_reset_time = time.time()
 
         # Preprocessing
         self.input_wav[: -self.block_frame] = self.input_wav[self.block_frame :].clone()
