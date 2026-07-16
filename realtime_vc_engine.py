@@ -578,28 +578,25 @@ class RealtimeVCEngine:
             # value. self.stream.latency is available once the stream is opened.
             input_latency = self.stream.latency[0]
             output_latency = self.stream.latency[1]
-            # Duplex buffering only: in_lat/out_lat each already cover ~one block,
-            # so this must NOT add block_time again. Used as the fallback latency
-            # when the host API has no usable timestamps.
+            # PortAudio's own buffering, about one blocksize each way. This is the
+            # fallback hardware leg for host APIs with no usable timestamps.
             self._hw_latency = input_latency + output_latency
-            self.delay_time = (
-                input_latency + output_latency
-                + self.config.block_time
-                + self.config.crossfade_time
-                + 0.01
-                + 0.5
-            )
+            # The same formula _measure_latency uses, with the hardware leg estimated
+            # from stream.latency instead of read from the callback timestamps. So on
+            # a host API without timestamps this IS measured_delay_time, and on one
+            # with them the gap between the two is what the estimate misses (the
+            # driver-to-DAC leg stream.latency does not report) - i.e. exactly the
+            # trim a Windows user has to dial into Sync Offset.
+            self.delay_time = self._hw_latency + self._prime_time + self.active_extra_time_right
             print(f"Audio Delay Calculated: {self.delay_time*1000:.2f}ms")
-            # Breakdown to diagnose where the latency comes from. in_lat/out_lat
-            # is the PortAudio hardware buffering (dominated by 'high' latency
-            # mode on Linux/Pulse); the algorithmic look-ahead (extra_time_right)
-            # is REAL perceived latency but is NOT part of delay_time.
+            # Where the latency comes from. in_lat/out_lat is PortAudio's buffering,
+            # now decoupled from the model hop; prime is the pipeline's head start
+            # and normally dominates; look-ahead is the algorithmic one.
             print(
                 f"  [breakdown] in_lat={input_latency*1000:.1f}ms "
                 f"out_lat={output_latency*1000:.1f}ms "
-                f"block={self.config.block_time*1000:.1f}ms "
-                f"crossfade={self.config.crossfade_time*1000:.1f}ms fixed=510.0ms | "
-                f"look-ahead extra_time_right={self.config.extra_time_right*1000:.1f}ms (not in delay_time)"
+                f"prime={self._prime_time*1000:.1f}ms (2 x block_time={self.config.block_time*1000:.1f}ms) "
+                f"look-ahead={self.active_extra_time_right*1000:.1f}ms"
             )
 
             # Worker before stream: it must already be draining the input ring when
@@ -747,8 +744,8 @@ class RealtimeVCEngine:
                 print(
                     f"  [measured] host API '{self._hostapi_name}' does not implement real "
                     f"timestamps; falling back to estimate = {self.measured_delay_time*1000:.1f}ms. "
-                    f"A/V sync needs a one-off Sync Offset trim (the estimate is short by a fixed "
-                    f"amount for a given device and block_time)."
+                    f"A/V sync needs a one-off Sync Offset trim: the estimate is short by the "
+                    f"driver-to-DAC leg, which is a constant for a given device (~30ms here)."
                 )
                 self._measured_logged = True
         else:
