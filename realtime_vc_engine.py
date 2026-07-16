@@ -29,8 +29,23 @@ from funasr import AutoModel
 # Suppress warnings
 warnings.simplefilter("ignore")
 
-# Any capture->playback span beyond this is not a real latency, it means the host
-# API gave us unusable timestamps (see _measure_latency).
+# Host APIs whose callback timestamps are real hardware timestamps, so that
+# outputBufferDacTime - inputBufferAdcTime is the true mic->speaker latency.
+# This is a per-host-API property of PortAudio's implementation, not something we
+# can detect at runtime - a bad backend still returns plausible-looking numbers.
+# Verified against the PortAudio sources (see docs/DELAY_LOGIC.md):
+#   ALSA        - driver timestamp (snd_pcm_status) + snd_pcm_delay  -> real. TRUSTED.
+#   WASAPI      - PaUtil_GetTime() +/- IAudioClient::GetCurrentPadding(): momentary
+#                 queue occupancy, not latency. Reads ~10x low and jitters.
+#   DirectSound - outputBufferDacTime = currentTime; the "+ outputLatency" line is
+#                 commented out in the source, so the whole output side is missing.
+#   MME         - "@todo implement inputBufferAdcTime": adc is always 0.
+#   WDM-KS      - timestamps not implemented (PortAudio issue #531).
+# So on Windows there is no usable measurement: every host API falls back below.
+TIMESTAMP_CAPABLE_HOSTAPIS = frozenset({"ALSA"})
+
+# Even on a trusted host API, an xrun can make snd_pcm_delay return nonsense.
+# Any capture->playback span beyond this is not a real latency (see _measure_latency).
 MAX_PLAUSIBLE_LATENCY_S = 5.0
 
 # FSMN-VAD needs at least this much audio per call. Below it the LFR window yields
@@ -76,6 +91,7 @@ class RealtimeVCEngine:
         self.delay_time = 0.0
         self.measured_delay_time = 0.0  # end-to-end latency (s) that drives A/V sync
         self._hw_latency = 0.0          # input+output hardware latency, for the fallback estimate
+        self._hostapi_name = ""         # host API actually in use; gates the measurement
         self._measured_logged = False
         self.last_error_print_time = 0
         
@@ -486,6 +502,18 @@ class RealtimeVCEngine:
                  except Exception as e:
                      print(f"Error setting devices: {e}")
 
+            # Resolve the host API actually in use, which is what decides whether the
+            # timestamps are real. config.sg_hostapi is only what the GUI selected: if
+            # the device match above failed we are now on the system default, which may
+            # sit on a different host API.
+            try:
+                self._hostapi_name = sd.query_hostapis(
+                    sd.query_devices(kind="input")["hostapi"]
+                )["name"]
+            except Exception as e:
+                self._hostapi_name = ""
+                print(f"Could not resolve the host API in use ({e}); assuming no timestamps.")
+
             self._prepare_buffers()
             self.flag_vc = True
 
@@ -622,10 +650,13 @@ class RealtimeVCEngine:
     def _measure_latency(self, times):
         """Real capture->playback latency (s) from PortAudio timestamps, or None.
 
-        Returns None when the host API does not supply usable timestamps: Windows
-        MME/DirectSound report inputBufferAdcTime == 0, which would otherwise make
-        the span come out as PortAudio's absolute clock (i.e. wildly wrong).
+        Returns None when the host API does not implement the timestamps, in which
+        case the caller falls back to the hardware-latency estimate. Checking the
+        numbers alone is not enough: WASAPI and DirectSound both return values that
+        look plausible but are far too small, so the host API is checked first.
         """
+        if self._hostapi_name not in TIMESTAMP_CAPABLE_HOSTAPIS:
+            return None
         adc = times.inputBufferAdcTime
         dac = times.outputBufferDacTime
         if adc <= 0 or dac <= 0:
@@ -646,9 +677,10 @@ class RealtimeVCEngine:
             self.measured_delay_time = self._hw_latency + self.active_extra_time_right
             if not self._measured_logged:
                 print(
-                    f"  [measured] host API gives no usable timestamps; falling back to estimate "
-                    f"= {self.measured_delay_time*1000:.1f}ms. A/V sync may need the Sync Offset "
-                    f"slider. On Windows, prefer the 'Windows WASAPI' host API over 'MME'."
+                    f"  [measured] host API '{self._hostapi_name}' does not implement real "
+                    f"timestamps; falling back to estimate = {self.measured_delay_time*1000:.1f}ms. "
+                    f"A/V sync needs a one-off Sync Offset trim (the estimate is short by a fixed "
+                    f"amount for a given device and block_time)."
                 )
                 self._measured_logged = True
         else:
