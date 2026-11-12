@@ -73,7 +73,6 @@ def save_checkpoint(filepath, obj):
 
 
 def scan_checkpoint(cp_dir, prefix, renamed_file=None):
-    # Fallback to original scanning logic first
     pattern = os.path.join(cp_dir, prefix + "????????")
     cp_list = glob.glob(pattern)
 
@@ -82,7 +81,6 @@ def scan_checkpoint(cp_dir, prefix, renamed_file=None):
         print(f"[INFO] Resuming from checkpoint: '{last_checkpoint_path}'")
         return last_checkpoint_path
 
-    # If no pattern-based checkpoints are found, check for renamed file
     if renamed_file:
         renamed_path = os.path.join(cp_dir, renamed_file)
         if os.path.isfile(renamed_path):

@@ -30,9 +30,7 @@
 
 namespace
 {
-    // Hard-coded hyperparameters
-    // WARP_SIZE and WARP_BATCH must match the return values batches_per_warp and
-    constexpr int ELEMENTS_PER_LDG_STG = 1; //(WARP_ITERATIONS < 4) ? 1 : 4;
+    constexpr int ELEMENTS_PER_LDG_STG = 1;
     constexpr int BUFFER_SIZE = 32;
     constexpr int FILTER_SIZE = 12;
     constexpr int HALF_FILTER_SIZE = 6;
@@ -52,7 +50,6 @@ namespace
         int channels,
         int seq_len)
     {
-        // Up and downsample filters
         input_t up_filter[FILTER_SIZE];
         input_t down_filter[FILTER_SIZE];
 
@@ -78,8 +75,7 @@ namespace
         input_t seq_left_most_value = right_most_pntr[0];
         input_t seq_right_most_value = right_most_pntr[seq_len - 1];
 
-        // Move src and dst pointers
-        src += block_offset + local_offset;
+        src +=block_offset + local_offset;
         dst += block_offset + local_offset;
 
         // Alpha and beta values for snake activatons. Applies exp by default
@@ -99,7 +95,7 @@ namespace
         #pragma unroll
         for (int it = -HALF_FILTER_SIZE; it < BUFFER_SIZE + HALF_FILTER_SIZE; it += 1)
         {
-            int element_index = seq_offset + it; // index for element
+            int element_index = seq_offset + it;
             if ((element_index < 0) && (element_index >= -UPSAMPLE_REPLICATION_PAD))
             {
                 elements[2 * (HALF_FILTER_SIZE + it)] = 2 * seq_left_most_value;
@@ -119,7 +115,7 @@ namespace
         for (int it = 0; it < (2 * BUFFER_SIZE + 2 * FILTER_SIZE); it += 1)
         {
             input_t acc = 0.0;
-            int element_index = intermediate_seq_offset + it; // index for intermediate
+            int element_index = intermediate_seq_offset + it;
             #pragma unroll
             for (int f_idx = 0; f_idx < FILTER_SIZE; f_idx += 1)
             {
@@ -165,7 +161,6 @@ namespace
             output[it] = acc;
         }
 
-        // Write output to dst
         #pragma unroll
         for (int it = 0;  it < BUFFER_SIZE;  it += ELEMENTS_PER_LDG_STG)
         {
@@ -216,7 +211,6 @@ extern "C" torch::Tensor fwd_cuda(torch::Tensor const &input, torch::Tensor cons
     const int channels = input.size(1);
     const int seq_len = input.size(2);
 
-    // Output
     auto act_options = input.options().requires_grad(false);
 
     torch::Tensor anti_alias_activation_results =

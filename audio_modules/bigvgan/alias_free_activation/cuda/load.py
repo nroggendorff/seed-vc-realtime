@@ -22,12 +22,10 @@ def load():
         cc_flag.append("-gencode")
         cc_flag.append("arch=compute_80,code=sm_80")
 
-    # Build path
     srcpath = pathlib.Path(__file__).parent.absolute()
     buildpath = srcpath / "build"
     _create_build_dir(buildpath)
 
-    # Helper function to build the kernels.
     def _cpp_extention_load_helper(name, sources, extra_cuda_flags):
         return cpp_extension.load(
             name=name,

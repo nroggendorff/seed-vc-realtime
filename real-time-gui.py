@@ -15,26 +15,22 @@ from dotenv import load_dotenv
 from realtime_vc_engine import RealtimeVCEngine
 from audio_modules.commons import str2bool
 
-# Load environment variables
 load_dotenv()
 os.environ["OMP_NUM_THREADS"] = "4"
 if sys.platform == "darwin":
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
-# Add current directory to path
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
-# Resolve config paths against this script, not the CWD: the launcher may start us
-# from anywhere, and unified_launcher.py restores the CWD to the repo root after
-# initialising the engine.
+# Resolve config paths against this script, not the CWD: the launcher may start us from anywhere, and unified_launcher.py restores the CWD to the repo root after initialising the engine.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.join(SCRIPT_DIR, "configs", "config.json")
 INUSE_CONFIG_DIR = os.path.join(SCRIPT_DIR, "configs", "inuse")
 INUSE_CONFIG_PATH = os.path.join(INUSE_CONFIG_DIR, "config.json")
 
-# Suppress warnings
 warnings.simplefilter("ignore")
+
 
 def printt(strr, *args):
     if len(args) == 0:
@@ -42,20 +38,17 @@ def printt(strr, *args):
     else:
         print(strr % args)
 
+
 class GUI:
     def __init__(self, args) -> None:
         self.engine = RealtimeVCEngine(args)
 
-        # Setup callback for performance monitoring
         self.engine.on_perf_update = self.update_perf_stats
         self.last_gui_update = 0
 
         self.function = "vc"
 
-        # Shared memory is the IPC channel for the legacy two-process launcher
-        # (launcher.py): this GUI publishes the measured audio latency so the
-        # separate video process can sync to it. The engine itself stays free of
-        # any sync/IPC concern - it only reports its timings via on_perf_update.
+        # Shared memory is the IPC channel for the legacy two-process launcher (launcher.py): this GUI publishes the measured audio latency so the separate video process can sync to it. The engine itself stays free of any sync/IPC concern--it only reports its timings via on_perf_update.
         self.shm = None
         shm_name = os.environ.get("RAS_SHARED_MEM_NAME")
         if shm_name:
@@ -65,7 +58,6 @@ class GUI:
             except Exception as e:
                 print(f"Failed to connect to Shared Memory: {e}")
 
-        # Load initial configuration and devices
         self.update_devices()
         self.launcher()
 
@@ -74,14 +66,13 @@ class GUI:
         if not self.shm:
             return
         try:
-            self.shm.buf[0:8] = struct.pack('d', delay_seconds * 1000)
+            self.shm.buf[0:8] = struct.pack("d", delay_seconds * 1000)
         except Exception as e:
             print(f"Failed to publish audio delay to SHM: {e}")
 
     def update_perf_stats(self, infer_time, delay_time, measured_delay_time):
         """Callback to update UI with performance stats"""
-        # Publish every callback (cheap) so the video process tracks latency
-        # promptly; the UI update below stays throttled.
+        # Publish every callback (cheap) so the video process tracks latency promptly; the UI update below stays throttled.
         self.publish_audio_delay(measured_delay_time)
 
         if time.time() - self.last_gui_update < 0.1:
@@ -99,12 +90,13 @@ class GUI:
             os.makedirs(INUSE_CONFIG_DIR, exist_ok=True)
             if not os.path.exists(INUSE_CONFIG_PATH):
                 import shutil
+
                 shutil.copy(DEFAULT_CONFIG_PATH, INUSE_CONFIG_PATH)
             with open(INUSE_CONFIG_PATH, "r") as j:
                 data = json.load(j)
                 data["sr_model"] = data["sr_type"] == "sr_model"
                 data["sr_device"] = data["sr_type"] == "sr_device"
-                
+
                 if data["sg_hostapi"] in self.engine.hostapis:
                     self.update_devices(hostapi_name=data["sg_hostapi"])
                     if (
@@ -113,24 +105,27 @@ class GUI:
                     ):
                         self.update_devices()
                         data["sg_hostapi"] = self.engine.hostapis[0]
-                        # Safe fallback: the host API default, never devices[0]
-                        # (that is the monitor's HDMI audio on a typical Linux box).
+                        # Safe fallback: the host API default, never devices[0] (that is the monitor's HDMI audio on a typical Linux box).
                         data["sg_input_device"] = self.engine.preferred_device("input")
-                        data["sg_output_device"] = self.engine.preferred_device("output")
+                        data["sg_output_device"] = self.engine.preferred_device(
+                            "output"
+                        )
                 else:
-                    self.update_devices() # Reset to default hostapi
+                    self.update_devices()
                     data["sg_hostapi"] = self.engine.hostapis[0]
                     data["sg_input_device"] = self.engine.preferred_device("input")
                     data["sg_output_device"] = self.engine.preferred_device("output")
         except Exception as e:
             print(f"Error loading config: {e}")
-            # Default config creation logic could go here
             self.update_devices()
             data = {
                 "sg_hostapi": self.engine.hostapis[0] if self.engine.hostapis else "",
-                "sg_input_device": self.engine.input_devices[0] if self.engine.input_devices else "",
-                "sg_output_device": self.engine.output_devices[0] if self.engine.output_devices else "",
-                # ... defaults ...
+                "sg_input_device": (
+                    self.engine.input_devices[0] if self.engine.input_devices else ""
+                ),
+                "sg_output_device": (
+                    self.engine.output_devices[0] if self.engine.output_devices else ""
+                ),
                 "sr_type": "sr_model",
                 "sr_model": True,
                 "sr_device": False,
@@ -366,8 +361,7 @@ class GUI:
 
     def update_devices(self, hostapi_name=None):
         self.engine.update_devices(hostapi_name)
-        # No local state needed for devices, we read from engine
-        
+
     def event_handler(self):
         while True:
             event, values = self.window.read()
@@ -375,32 +369,36 @@ class GUI:
                 self.engine.stop_stream()
                 self.publish_audio_delay(0.0)  # tell the video process audio is idle
                 exit()
-            
+
             if event == "reload_devices" or event == "sg_hostapi":
                 hostapi = values["sg_hostapi"]
                 self.update_devices(hostapi_name=hostapi)
-                
-                # Check bounds and update UI
+
                 if hostapi not in self.engine.hostapis:
-                     hostapi = self.engine.hostapis[0] if self.engine.hostapis else ""
-                     
+                    hostapi = self.engine.hostapis[0] if self.engine.hostapis else ""
+
                 self.window["sg_hostapi"].Update(values=self.engine.hostapis)
                 self.window["sg_hostapi"].Update(value=hostapi)
-                
+
                 self.window["sg_input_device"].Update(values=self.engine.input_devices)
                 if self.engine.input_devices:
-                    self.window["sg_input_device"].Update(value=self.engine.input_devices[0])
-                    
-                self.window["sg_output_device"].Update(values=self.engine.output_devices)
+                    self.window["sg_input_device"].Update(
+                        value=self.engine.input_devices[0]
+                    )
+
+                self.window["sg_output_device"].Update(
+                    values=self.engine.output_devices
+                )
                 if self.engine.output_devices:
-                    self.window["sg_output_device"].Update(value=self.engine.output_devices[0])
+                    self.window["sg_output_device"].Update(
+                        value=self.engine.output_devices[0]
+                    )
 
             if event == "start_vc" and not self.engine.flag_vc:
                 if self.set_values(values) == True:
                     printt("cuda_is_available: %s", torch.cuda.is_available())
                     self.engine.start_stream()
-                    
-                    # Save settings
+
                     settings = {
                         "reference_audio_path": values["reference_audio_path"],
                         "sg_hostapi": values["sg_hostapi"],
@@ -425,27 +423,24 @@ class GUI:
                             json.dump(settings, j)
                     except:
                         pass
-                        
-                    self.window["sr_stream"].update(self.engine.config.samplerate)
-                    if hasattr(self.engine, 'delay_time'):
-                         self.window["delay_time"].update(int(np.round(self.engine.delay_time * 1000)))
 
-            # Parameter hot update
+                    self.window["sr_stream"].update(self.engine.config.samplerate)
+                    if hasattr(self.engine, "delay_time"):
+                        self.window["delay_time"].update(
+                            int(np.round(self.engine.delay_time * 1000))
+                        )
+
+            # These apply live; every other setting takes effect on the next start.
             elif event == "diffusion_steps":
                 self.engine.set_config(diffusion_steps=values["diffusion_steps"])
             elif event == "inference_cfg_rate":
                 self.engine.set_config(inference_cfg_rate=values["inference_cfg_rate"])
             elif event in ["vc", "im"]:
                 self.function = event
-                # Pass the function mode to engine
                 self.engine.set_config(function=event)
-                
+
             elif event == "stop_vc":
-                # Only an explicit stop stops the stream. This used to be a
-                # catch-all (`or event != "start_vc"`), so touching any other
-                # control - including a settings slider - killed the conversion.
-                # Settings that need new buffers are applied on the next start;
-                # reloading devices stops the stream inside update_devices anyway.
+                # Only an explicit stop stops the stream--not any other control event. Settings that need new buffers are applied on the next start; reloading devices stops the stream inside update_devices.
                 self.engine.stop_stream()
                 self.publish_audio_delay(0.0)  # tell the video process audio is idle
 
@@ -453,16 +448,15 @@ class GUI:
         if len(values["reference_audio_path"].strip()) == 0:
             sg.popup("Choose an audio file")
             return False
-        pattern = re.compile("[^\x00-\x7F]+")
+        pattern = re.compile("[^\x00-\x7f]+")
         if pattern.findall(values["reference_audio_path"]):
             sg.popup("audio file path contains non-ascii characters")
             return False
-            
-        # Push all config to engine
+
         sr_type = ["sr_model", "sr_device"][
             [values["sr_model"], values["sr_device"]].index(True)
         ]
-        
+
         self.engine.set_config(
             sg_hostapi=values["sg_hostapi"],
             sg_wasapi_exclusive=values["sg_wasapi_exclusive"],
@@ -474,7 +468,7 @@ class GUI:
             inference_cfg_rate=values["inference_cfg_rate"],
             max_prompt_length=values["max_prompt_length"],
             block_time=values["block_time"],
-            crossfade_time=values["crossfade_length"], # Note name change in my Engine Config: crossfade_time vs crossfade_length
+            crossfade_time=values["crossfade_length"],
             extra_time_ce=values["extra_time_ce"],
             extra_time=values["extra_time"],
             extra_time_right=values["extra_time_right"],
@@ -484,10 +478,21 @@ class GUI:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint-path", type=str, default=None, help="Path to the model checkpoint")
-    parser.add_argument("--config-path", type=str, default=None, help="Path to the vocoder checkpoint")
-    parser.add_argument("--fp16", type=str2bool, nargs="?", const=True, help="Whether to use fp16", default=True)
+    parser.add_argument(
+        "--checkpoint-path", type=str, default=None, help="Path to the model checkpoint"
+    )
+    parser.add_argument(
+        "--config-path", type=str, default=None, help="Path to the vocoder checkpoint"
+    )
+    parser.add_argument(
+        "--fp16",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        help="Whether to use fp16",
+        default=True,
+    )
     parser.add_argument("--gpu", type=int, help="Which GPU id to use", default=0)
     args = parser.parse_args()
-    
+
     gui = GUI(args)

@@ -7,6 +7,7 @@ from munch import Munch
 import json
 import argparse
 
+
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -16,6 +17,7 @@ def str2bool(v):
         return False
     else:
         raise argparse.ArgumentTypeError("Boolean value expected.")
+
 
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
@@ -213,7 +215,6 @@ def log_norm(x, mean=-4, std=4, dim=2):
 
 
 def load_F0_models(path):
-    # load F0 model
     from .JDC.model import JDCNet
 
     F0_model = JDCNet(num_class=1, seq_len=192)
@@ -250,7 +251,6 @@ def modify_w2v_forward(self, output_layer=15):
                 ~attention_mask.bool().unsqueeze(-1), 0.0
             )
 
-            # extend attention_mask
             attention_mask = 1.0 - attention_mask[:, None, None, :].to(
                 dtype=hidden_states.dtype
             )
@@ -362,24 +362,19 @@ def plot_spectrogram_to_numpy(spectrogram):
 
 
 def normalize_f0(f0_sequence):
-    # Remove unvoiced frames (replace with -1)
     voiced_indices = np.where(f0_sequence > 0)[0]
     f0_voiced = f0_sequence[voiced_indices]
 
-    # Convert to log scale
     log_f0 = np.log2(f0_voiced)
 
-    # Calculate mean and standard deviation
     mean_f0 = np.mean(log_f0)
     std_f0 = np.std(log_f0)
 
-    # Normalize the F0 sequence
     normalized_f0 = (log_f0 - mean_f0) / std_f0
 
-    # Create the normalized F0 sequence with unvoiced frames
     normalized_sequence = np.zeros_like(f0_sequence)
     normalized_sequence[voiced_indices] = normalized_f0
-    normalized_sequence[f0_sequence <= 0] = -1  # Assign -1 to unvoiced frames
+    normalized_sequence[f0_sequence <= 0] = -1
 
     return normalized_sequence
 
@@ -393,10 +388,22 @@ def build_model(args, stage="DiT"):
             channels=args.length_regulator.channels,
             sampling_ratios=args.length_regulator.sampling_ratios,
             is_discrete=args.length_regulator.is_discrete,
-            in_channels=args.length_regulator.in_channels if hasattr(args.length_regulator, "in_channels") else None,
+            in_channels=(
+                args.length_regulator.in_channels
+                if hasattr(args.length_regulator, "in_channels")
+                else None
+            ),
             codebook_size=args.length_regulator.content_codebook_size,
-            f0_condition=args.length_regulator.f0_condition if hasattr(args.length_regulator, "f0_condition") else False,
-            n_f0_bins=args.length_regulator.n_f0_bins if hasattr(args.length_regulator, "n_f0_bins") else 512,
+            f0_condition=(
+                args.length_regulator.f0_condition
+                if hasattr(args.length_regulator, "f0_condition")
+                else False
+            ),
+            n_f0_bins=(
+                args.length_regulator.n_f0_bins
+                if hasattr(args.length_regulator, "n_f0_bins")
+                else 512
+            ),
         )
         cfm = CFM(args)
         nets = Munch(
@@ -439,7 +446,6 @@ def load_checkpoint(
                         params[key][k[len("module.") :]] = params[key][k]
                         del params[key][k]
             model_state_dict = model[key].state_dict()
-            # 过滤出形状匹配的键值对
             filtered_state_dict = {
                 k: v
                 for k, v in params[key].items()

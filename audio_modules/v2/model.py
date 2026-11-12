@@ -17,6 +17,7 @@ def find_multiple(n: int, k: int) -> int:
         return n
     return n + k - (n % k)
 
+
 class AdaptiveLayerNorm(nn.Module):
     r"""Adaptive Layer Normalization"""
 
@@ -62,15 +63,19 @@ class ModelArgs:
             hidden_dim = 4 * self.dim
             n_hidden = int(2 * hidden_dim / 3)
             self.intermediate_size = find_multiple(n_hidden, 256)
-        # self.head_dim = self.dim // self.n_head
+
 
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
         self.config = config
 
-        self.layers = nn.ModuleList(TransformerBlock(config) for _ in range(config.n_layer))
-        self.norm = AdaptiveLayerNorm(config.dim, RMSNorm(config.dim, eps=config.norm_eps))
+        self.layers = nn.ModuleList(
+            TransformerBlock(config) for _ in range(config.n_layer)
+        )
+        self.norm = AdaptiveLayerNorm(
+            config.dim, RMSNorm(config.dim, eps=config.norm_eps)
+        )
 
         self.freqs_cis: Optional[Tensor] = None
         self.mask_cache: Optional[Tensor] = None
@@ -78,7 +83,10 @@ class Transformer(nn.Module):
         self.max_seq_length = -1
 
     def setup_caches(self, max_batch_size, max_seq_length, use_kv_cache=False):
-        if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
+        if (
+            self.max_seq_length >= max_seq_length
+            and self.max_batch_size >= max_batch_size
+        ):
             return
         head_dim = self.config.dim // self.config.n_head
         max_seq_length = find_multiple(max_seq_length, 8)
@@ -87,29 +95,37 @@ class Transformer(nn.Module):
         dtype = self.norm.project_layer.weight.dtype
         device = self.norm.project_layer.weight.device
 
-        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.head_dim,
-                                              self.config.rope_base, dtype).to(device)
-        self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool)).to(device)
+        self.freqs_cis = precompute_freqs_cis(
+            self.config.block_size, self.config.head_dim, self.config.rope_base, dtype
+        ).to(device)
+        self.causal_mask = torch.tril(
+            torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool)
+        ).to(device)
         self.use_kv_cache = use_kv_cache
         self.uvit_skip_connection = self.config.uvit_skip_connection
         if self.uvit_skip_connection:
-            self.layers_emit_skip = [i for i in range(self.config.n_layer) if i < self.config.n_layer // 2]
-            self.layers_receive_skip = [i for i in range(self.config.n_layer) if i > self.config.n_layer // 2]
+            self.layers_emit_skip = [
+                i for i in range(self.config.n_layer) if i < self.config.n_layer // 2
+            ]
+            self.layers_receive_skip = [
+                i for i in range(self.config.n_layer) if i > self.config.n_layer // 2
+            ]
         else:
             self.layers_emit_skip = []
             self.layers_receive_skip = []
 
-    def forward(self,
-                x: Tensor,
-                c: Tensor,
-                input_pos: Optional[Tensor] = None,
-                mask: Optional[Tensor] = None,
-                context: Optional[Tensor] = None,
-                context_input_pos: Optional[Tensor] = None,
-                cross_attention_mask: Optional[Tensor] = None,
-                ) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        c: Tensor,
+        input_pos: Optional[Tensor] = None,
+        mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_input_pos: Optional[Tensor] = None,
+        cross_attention_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
-        if mask is None: # in case of non-causal model
+        if mask is None:  # in case of non-causal model
             if not self.training and self.use_kv_cache:
                 mask = self.causal_mask[None, None, input_pos]
             else:
@@ -126,7 +142,17 @@ class Transformer(nn.Module):
                 skip_in_x = skip_in_x_list.pop(-1)
             else:
                 skip_in_x = None
-            x = layer(x, c, input_pos, freqs_cis, mask, context, context_freqs_cis, cross_attention_mask, skip_in_x)
+            x = layer(
+                x,
+                c,
+                input_pos,
+                freqs_cis,
+                mask,
+                context,
+                context_freqs_cis,
+                cross_attention_mask,
+                skip_in_x,
+            )
             if self.uvit_skip_connection and i in self.layers_emit_skip:
                 skip_in_x_list.append(x)
         x = self.norm(x, c)
@@ -142,13 +168,19 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.attention = Attention(config)
         self.feed_forward = FeedForward(config)
-        self.ffn_norm = AdaptiveLayerNorm(config.dim, RMSNorm(config.dim, eps=config.norm_eps))
-        self.attention_norm = AdaptiveLayerNorm(config.dim, RMSNorm(config.dim, eps=config.norm_eps))
+        self.ffn_norm = AdaptiveLayerNorm(
+            config.dim, RMSNorm(config.dim, eps=config.norm_eps)
+        )
+        self.attention_norm = AdaptiveLayerNorm(
+            config.dim, RMSNorm(config.dim, eps=config.norm_eps)
+        )
 
         if config.has_cross_attention:
             self.has_cross_attention = True
             self.cross_attention = Attention(config, is_cross_attention=True)
-            self.cross_attention_norm = AdaptiveLayerNorm(config.dim, RMSNorm(config.dim, eps=config.norm_eps))
+            self.cross_attention_norm = AdaptiveLayerNorm(
+                config.dim, RMSNorm(config.dim, eps=config.norm_eps)
+            )
         else:
             self.has_cross_attention = False
 
@@ -160,23 +192,31 @@ class TransformerBlock(nn.Module):
 
         self.time_as_token = config.time_as_token
 
-    def forward(self,
-                x: Tensor,
-                c: Tensor,
-                input_pos: Tensor,
-                freqs_cis: Tensor,
-                mask: Tensor,
-                context: Optional[Tensor] = None,
-                context_freqs_cis: Optional[Tensor] = None,
-                cross_attention_mask: Optional[Tensor] = None,
-                skip_in_x: Optional[Tensor] = None,
-                ) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        c: Tensor,
+        input_pos: Tensor,
+        freqs_cis: Tensor,
+        mask: Tensor,
+        context: Optional[Tensor] = None,
+        context_freqs_cis: Optional[Tensor] = None,
+        cross_attention_mask: Optional[Tensor] = None,
+        skip_in_x: Optional[Tensor] = None,
+    ) -> Tensor:
         c = None if self.time_as_token else c
         if self.uvit_skip_connection and skip_in_x is not None:
             x = self.skip_in_linear(torch.cat([x, skip_in_x], dim=-1))
         h = x + self.attention(self.attention_norm(x, c), freqs_cis, mask, input_pos)
         if self.has_cross_attention:
-            h = h + self.cross_attention(self.cross_attention_norm(h, c), freqs_cis, cross_attention_mask, input_pos, context, context_freqs_cis)
+            h = h + self.cross_attention(
+                self.cross_attention_norm(h, c),
+                freqs_cis,
+                cross_attention_mask,
+                input_pos,
+                context,
+                context_freqs_cis,
+            )
         out = h + self.feed_forward(self.ffn_norm(h, c))
         return out
 
@@ -190,7 +230,11 @@ class Attention(nn.Module):
         # key, query, value projections for all heads, but in a batch
         if is_cross_attention:
             self.wq = nn.Linear(config.dim, config.n_head * config.head_dim, bias=False)
-            self.wkv = nn.Linear(config.context_dim, 2 * config.n_local_heads * config.head_dim, bias=False)
+            self.wkv = nn.Linear(
+                config.context_dim,
+                2 * config.n_local_heads * config.head_dim,
+                bias=False,
+            )
         else:
             self.wqkv = nn.Linear(config.dim, total_head_dim, bias=False)
         self.wo = nn.Linear(config.head_dim * config.n_head, config.dim, bias=False)
@@ -200,23 +244,16 @@ class Attention(nn.Module):
         self.head_dim = config.head_dim
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
-        # self._register_load_state_dict_pre_hook(self.load_hook)
 
-    # def load_hook(self, state_dict, prefix, *args):
-    #     if prefix + "wq.weight" in state_dict:
-    #         wq = state_dict.pop(prefix + "wq.weight")
-    #         wk = state_dict.pop(prefix + "wk.weight")
-    #         wv = state_dict.pop(prefix + "wv.weight")
-    #         state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
-
-    def forward(self,
-                x: Tensor,
-                freqs_cis: Tensor,
-                mask: Tensor,
-                input_pos: Optional[Tensor] = None,
-                context: Optional[Tensor] = None,
-                context_freqs_cis: Optional[Tensor] = None,
-                ) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        freqs_cis: Tensor,
+        mask: Tensor,
+        input_pos: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_freqs_cis: Optional[Tensor] = None,
+    ) -> Tensor:
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim
@@ -233,7 +270,9 @@ class Attention(nn.Module):
         v = v.view(bsz, context_seqlen, self.n_local_heads, self.head_dim)
 
         q = apply_rotary_emb(q, freqs_cis)
-        k = apply_rotary_emb(k, context_freqs_cis if context_freqs_cis is not None else freqs_cis)
+        k = apply_rotary_emb(
+            k, context_freqs_cis if context_freqs_cis is not None else freqs_cis
+        )
 
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
@@ -244,7 +283,11 @@ class Attention(nn.Module):
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
-        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.head_dim * self.n_head)
+        y = (
+            y.transpose(1, 2)
+            .contiguous()
+            .view(bsz, seqlen, self.head_dim * self.n_head)
+        )
 
         y = self.wo(y)
         return y
@@ -276,10 +319,11 @@ class RMSNorm(nn.Module):
 
 
 def precompute_freqs_cis(
-        seq_len: int, n_elem: int, base: int = 10000,
-        dtype: torch.dtype = torch.bfloat16
+    seq_len: int, n_elem: int, base: int = 10000, dtype: torch.dtype = torch.bfloat16
 ) -> Tensor:
-    freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem))
+    freqs = 1.0 / (
+        base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem)
+    )
     t = torch.arange(seq_len, device=freqs.device)
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
