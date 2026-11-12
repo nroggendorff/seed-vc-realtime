@@ -69,11 +69,8 @@ class ConvReluNorm(nn.Module):
     def forward(self, x, x_mask):
         x_org = x
         for i in range(self.n_layers):
-            x = self.conv_layers[i](x * x_mask)
-            x = self.norm_layers[i](x)
-            x = self.relu_drop(x)
-        x = x_org + self.proj(x)
-        return x * x_mask
+            x = self.relu_drop(self.norm_layers[i](self.conv_layers[i](x * x_mask)))
+        return (x_org + self.proj(x)) * x_mask
 
 
 class DDSConv(nn.Module):
@@ -114,13 +111,8 @@ class DDSConv(nn.Module):
         if g is not None:
             x = x + g
         for i in range(self.n_layers):
-            y = self.convs_sep[i](x * x_mask)
-            y = self.norms_1[i](y)
-            y = F.gelu(y)
-            y = self.convs_1x1[i](y)
-            y = self.norms_2[i](y)
-            y = F.gelu(y)
-            y = self.drop(y)
+            y = self.norms_1[i](self.convs_sep[i](x * x_mask))
+            y = self.drop(F.gelu(self.norms_2[i](self.convs_1x1[i](F.gelu(y)))))
             x = x + y
         return x * x_mask
 
@@ -157,13 +149,12 @@ class WN(torch.nn.Module):
 
         for i in range(n_layers):
             dilation = dilation_rate**i
-            padding = int((kernel_size * dilation - dilation) / 2)
+            # No padding argument: SConv1d pads internally and never read one.
             in_layer = conv1d_type(
                 hidden_channels,
                 2 * hidden_channels,
                 kernel_size,
                 dilation=dilation,
-                padding=padding,
                 norm="weight_norm",
                 causal=causal,
             )
@@ -180,7 +171,7 @@ class WN(torch.nn.Module):
             )
             self.res_skip_layers.append(res_skip_layer)
 
-    def forward(self, x, x_mask, g=None, **kwargs):
+    def forward(self, x, x_mask, g=None):
         output = torch.zeros_like(x)
         n_channels_tensor = torch.IntTensor([self.hidden_channels])
 
@@ -200,8 +191,7 @@ class WN(torch.nn.Module):
 
             res_skip_acts = self.res_skip_layers[i](acts)
             if i < self.n_layers - 1:
-                res_acts = res_skip_acts[:, : self.hidden_channels, :]
-                x = (x + res_acts) * x_mask
+                x = (x + res_skip_acts[:, : self.hidden_channels, :]) * x_mask
                 output = output + res_skip_acts[:, self.hidden_channels :, :]
             else:
                 output = output + res_skip_acts

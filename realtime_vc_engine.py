@@ -274,8 +274,7 @@ class RealtimeVCEngine:
                         return_dict=True,
                     )
                 S_ori = ori_outputs.last_hidden_state.to(torch.float32)
-                S_ori = S_ori[:, : waves_16k.size(-1) // 320 + 1]
-                return S_ori
+                return S_ori[:, : waves_16k.size(-1) // 320 + 1]
 
         elif speech_tokenizer_type == "cnhubert":
             from transformers import Wav2Vec2FeatureExtractor, HubertModel
@@ -285,9 +284,7 @@ class RealtimeVCEngine:
                 hubert_model_name
             )
             hubert_model = HubertModel.from_pretrained(hubert_model_name)
-            hubert_model = hubert_model.to(self.device)
-            hubert_model = hubert_model.eval()
-            hubert_model = hubert_model.half()
+            hubert_model = hubert_model.to(self.device).eval().half()
 
             def semantic_fn(waves_16k):
                 ori_waves_16k_input_list = [
@@ -302,8 +299,7 @@ class RealtimeVCEngine:
                 ).to(self.device)
                 with torch.no_grad():
                     ori_outputs = hubert_model(ori_inputs.input_values.half())
-                S_ori = ori_outputs.last_hidden_state.float()
-                return S_ori
+                return ori_outputs.last_hidden_state.float()
 
         elif speech_tokenizer_type == "xlsr":
             from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2Model
@@ -315,9 +311,7 @@ class RealtimeVCEngine:
             )
             wav2vec_model = Wav2Vec2Model.from_pretrained(model_name)
             wav2vec_model.encoder.layers = wav2vec_model.encoder.layers[:output_layer]
-            wav2vec_model = wav2vec_model.to(self.device)
-            wav2vec_model = wav2vec_model.eval()
-            wav2vec_model = wav2vec_model.half()
+            wav2vec_model = wav2vec_model.to(self.device).eval().half()
 
             def semantic_fn(waves_16k):
                 ori_waves_16k_input_list = [
@@ -332,8 +326,7 @@ class RealtimeVCEngine:
                 ).to(self.device)
                 with torch.no_grad():
                     ori_outputs = wav2vec_model(ori_inputs.input_values.half())
-                S_ori = ori_outputs.last_hidden_state.float()
-                return S_ori
+                return ori_outputs.last_hidden_state.float()
 
         else:
             raise ValueError(f"Unknown speech tokenizer type: {speech_tokenizer_type}")
@@ -750,9 +743,7 @@ class RealtimeVCEngine:
             )[0]
             self.reference_wav_name = self.config.reference_audio_path
 
-        converted_waves_16k = input_wav_res
-
-        S_alt = semantic_fn(converted_waves_16k.unsqueeze(0))
+        S_alt = semantic_fn(input_wav_res.unsqueeze(0))
 
         ce_dit_frame_difference = int(self.ce_dit_difference * 50)
         S_alt = S_alt[:, ce_dit_frame_difference:]
@@ -784,7 +775,6 @@ class RealtimeVCEngine:
                 torch.LongTensor([cat_condition.size(1)]).to(self.mel2.device),
                 self.mel2,
                 self.style2,
-                None,
                 n_timesteps=int(self.config.diffusion_steps),
                 inference_cfg_rate=self.config.inference_cfg_rate,
             )
@@ -793,8 +783,7 @@ class RealtimeVCEngine:
 
         output_len = self.return_length * sr // 50
         tail_len = self.skip_tail * sr // 50
-        output = vc_wave[-output_len - tail_len : -tail_len]
-        return output
+        return vc_wave[-output_len - tail_len : -tail_len]
 
     def _measure_latency(self, times):
         """Real capture->playback latency (s) from PortAudio timestamps, or None.
@@ -825,6 +814,10 @@ class RealtimeVCEngine:
 
     def _audio_callback(self, indata, outdata, frames, times, status):
         # Copy only - anything slow here overruns PortAudio's deadline and drops audio. The pipeline runs on _worker.
+
+        # PortAudio's own xrun report (driver-level input overflow / output underflow). Distinct from the ring under/overflows below, which are the pipeline falling behind.
+        if status:
+            self._print_throttled(f"audio stream status: {status}")
 
         # Prefer the real measurement from PortAudio timestamps; fall back to the hardware-latency estimate where the host API cannot provide them.
         measured = self._measure_latency(times)

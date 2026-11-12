@@ -67,9 +67,7 @@ class ModelArgs:
         if self.n_local_heads == -1:
             self.n_local_heads = self.n_head
         if self.intermediate_size is None:
-            hidden_dim = 4 * self.dim
-            n_hidden = int(2 * hidden_dim / 3)
-            self.intermediate_size = find_multiple(n_hidden, 256)
+            self.intermediate_size = find_multiple(int(2 * (4 * self.dim) / 3), 256)
 
 
 class Transformer(nn.Module):
@@ -135,8 +133,7 @@ class Transformer(nn.Module):
             if not self.training and self.use_kv_cache:
                 mask = self.causal_mask[None, None, input_pos]
             else:
-                mask = self.causal_mask[None, None, input_pos]
-                mask = mask[..., input_pos]
+                mask = self.causal_mask[None, None, input_pos][..., input_pos]
         freqs_cis = self.freqs_cis[input_pos]
         if context is not None:
             context_freqs_cis = self.freqs_cis[context_input_pos]
@@ -161,8 +158,7 @@ class Transformer(nn.Module):
             )
             if self.uvit_skip_connection and i in self.layers_emit_skip:
                 skip_in_x_list.append(x)
-        x = self.norm(x, c)
-        return x
+        return self.norm(x, c)
 
     @classmethod
     def from_name(cls, name: str):
@@ -223,8 +219,7 @@ class TransformerBlock(nn.Module):
                 context,
                 context_freqs_cis,
             )
-        out = h + self.feed_forward(self.ffn_norm(h, c))
-        return out
+        return h + self.feed_forward(self.ffn_norm(h, c))
 
 
 class Attention(nn.Module):
@@ -295,8 +290,7 @@ class Attention(nn.Module):
             .view(bsz, seqlen, self.head_dim * self.n_head)
         )
 
-        y = self.wo(y)
-        return y
+        return self.wo(y)
 
 
 class FeedForward(nn.Module):
@@ -320,8 +314,7 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x: Tensor) -> Tensor:
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        return self._norm(x.float()).type_as(x) * self.weight
 
 
 def precompute_freqs_cis(
@@ -330,11 +323,9 @@ def precompute_freqs_cis(
     freqs = 1.0 / (
         base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem)
     )
-    t = torch.arange(seq_len, device=freqs.device)
-    freqs = torch.outer(t, freqs)
+    freqs = torch.outer(torch.arange(seq_len, device=freqs.device), freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-    cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
-    return cache.to(dtype=dtype)
+    return torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1).to(dtype=dtype)
 
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
@@ -348,8 +339,7 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
         -1,
     )
 
-    x_out2 = x_out2.flatten(3)
-    return x_out2.type_as(x)
+    return x_out2.flatten(3).type_as(x)
 
 
 def modulate(x, shift, scale):
@@ -400,9 +390,7 @@ class TimestepEmbedder(nn.Module):
         return embedding
 
     def forward(self, t):
-        t_freq = self.timestep_embedding(t)
-        t_emb = self.mlp(t_freq)
-        return t_emb
+        return self.mlp(self.timestep_embedding(t))
 
 
 class StyleEmbedder(nn.Module):
@@ -412,8 +400,7 @@ class StyleEmbedder(nn.Module):
 
     def __init__(self, input_size, hidden_size, dropout_prob):
         super().__init__()
-        use_cfg_embedding = dropout_prob > 0
-        self.embedding_table = nn.Embedding(int(use_cfg_embedding), hidden_size)
+        self.embedding_table = nn.Embedding(int(dropout_prob > 0), hidden_size)
         self.style_in = weight_norm(nn.Linear(input_size, hidden_size, bias=True))
         self.input_size = input_size
         self.dropout_prob = dropout_prob
@@ -424,8 +411,7 @@ class StyleEmbedder(nn.Module):
             labels = self.token_drop(labels, force_drop_ids)
         else:
             labels = self.style_in(labels)
-        embeddings = labels
-        return embeddings
+        return labels
 
 
 class FinalLayer(nn.Module):
@@ -445,9 +431,7 @@ class FinalLayer(nn.Module):
 
     def forward(self, x, c):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
-        x = self.linear(x)
-        return x
+        return self.linear(modulate(self.norm_final(x), shift, scale))
 
 
 class DiT(torch.nn.Module):
@@ -499,8 +483,7 @@ class DiT(torch.nn.Module):
 
         self.t_embedder = TimestepEmbedder(args.DiT.hidden_dim)
 
-        input_pos = torch.arange(16384)
-        self.register_buffer("input_pos", input_pos)
+        self.register_buffer("input_pos", torch.arange(16384))
 
         self.final_layer_type = args.DiT.final_layer_type  # mlp or wavenet
         if self.final_layer_type == "wavenet":
@@ -603,17 +586,14 @@ class DiT(torch.nn.Module):
         if self.long_skip_connection:
             x_res = self.skip_linear(torch.cat([x_res, x], dim=-1))
         if self.final_layer_type == "wavenet":
-            x = self.conv1(x_res)
-            x = x.transpose(1, 2)
+            x = self.conv1(x_res).transpose(1, 2)
             t2 = self.t_embedder2(t)
             x = self.wavenet(x, x_mask, g=t2.unsqueeze(2)).transpose(
                 1, 2
             ) + self.res_projection(
                 x_res
             )  # long residual connection
-            x = self.final_layer(x, t1).transpose(1, 2)
-            x = self.conv2(x)
+            x = self.conv2(self.final_layer(x, t1).transpose(1, 2))
         else:
-            x = self.final_mlp(x_res)
-            x = x.transpose(1, 2)
+            x = self.final_mlp(x_res).transpose(1, 2)
         return x

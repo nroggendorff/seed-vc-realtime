@@ -19,15 +19,11 @@ class FusedAntiAliasActivation(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inputs, up_ftr, down_ftr, alpha, beta):
-        activation_results = anti_alias_activation_cuda.forward(
-            inputs, up_ftr, down_ftr, alpha, beta
-        )
-
-        return activation_results
+    def forward(_ctx, inputs, up_ftr, down_ftr, alpha, beta):
+        return anti_alias_activation_cuda.forward(inputs, up_ftr, down_ftr, alpha, beta)
 
     @staticmethod
-    def backward(ctx, output_grads):
+    def backward(_ctx, output_grads):
         raise NotImplementedError
         return output_grads, None, None
 
@@ -53,10 +49,7 @@ class Activation1d(nn.Module):
 
     def forward(self, x):
         if not self.fused:
-            x = self.upsample(x)
-            x = self.act(x)
-            x = self.downsample(x)
-            return x
+            return self.downsample(self.act(self.upsample(x)))
         else:
             if self.act.__class__.__name__ == "Snake":
                 beta = self.act.alpha.data  # Snake uses same params for alpha and beta

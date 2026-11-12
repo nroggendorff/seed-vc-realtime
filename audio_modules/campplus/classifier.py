@@ -32,8 +32,7 @@ class CosineClassifier(nn.Module):
         for layer in self.blocks:
             x = layer(x)
 
-        x = F.linear(F.normalize(x), F.normalize(self.weight))
-        return x
+        return F.linear(F.normalize(x), F.normalize(self.weight))
 
 
 class LinearClassifier(nn.Module):
@@ -60,5 +59,4 @@ class LinearClassifier(nn.Module):
         x = self.nonlinear(x)
         for layer in self.blocks:
             x = layer(x)
-        x = self.linear(x)
-        return x
+        return self.linear(x)

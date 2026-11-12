@@ -74,11 +74,8 @@ class ConvReluNorm(nn.Module):
     def forward(self, x, x_mask):
         x_org = x
         for i in range(self.n_layers):
-            x = self.conv_layers[i](x * x_mask)
-            x = self.norm_layers[i](x)
-            x = self.relu_drop(x)
-        x = x_org + self.proj(x)
-        return x * x_mask
+            x = self.relu_drop(self.norm_layers[i](self.conv_layers[i](x * x_mask)))
+        return (x_org + self.proj(x)) * x_mask
 
 
 class DDSConv(nn.Module):
@@ -119,13 +116,8 @@ class DDSConv(nn.Module):
         if g is not None:
             x = x + g
         for i in range(self.n_layers):
-            y = self.convs_sep[i](x * x_mask)
-            y = self.norms_1[i](y)
-            y = F.gelu(y)
-            y = self.convs_1x1[i](y)
-            y = self.norms_2[i](y)
-            y = F.gelu(y)
-            y = self.drop(y)
+            y = self.norms_1[i](self.convs_sep[i](x * x_mask))
+            y = self.drop(F.gelu(self.norms_2[i](self.convs_1x1[i](F.gelu(y)))))
             x = x + y
         return x * x_mask
 
@@ -182,7 +174,7 @@ class WN(torch.nn.Module):
             res_skip_layer = torch.nn.utils.weight_norm(res_skip_layer, name="weight")
             self.res_skip_layers.append(res_skip_layer)
 
-    def forward(self, x, x_mask, g=None, **kwargs):
+    def forward(self, x, x_mask, g=None):
         output = torch.zeros_like(x)
         n_channels_tensor = torch.IntTensor([self.hidden_channels])
 
@@ -202,8 +194,7 @@ class WN(torch.nn.Module):
 
             res_skip_acts = self.res_skip_layers[i](acts)
             if i < self.n_layers - 1:
-                res_acts = res_skip_acts[:, : self.hidden_channels, :]
-                x = (x + res_acts) * x_mask
+                x = (x + res_skip_acts[:, : self.hidden_channels, :]) * x_mask
                 output = output + res_skip_acts[:, self.hidden_channels :, :]
             else:
                 output = output + res_skip_acts
@@ -298,8 +289,7 @@ class ResBlock1(torch.nn.Module):
             xt = F.leaky_relu(x, LRELU_SLOPE)
             if x_mask is not None:
                 xt = xt * x_mask
-            xt = c1(xt)
-            xt = F.leaky_relu(xt, LRELU_SLOPE)
+            xt = F.leaky_relu(c1(xt), LRELU_SLOPE)
             if x_mask is not None:
                 xt = xt * x_mask
             xt = c2(xt)
@@ -361,22 +351,19 @@ class ResBlock2(torch.nn.Module):
 
 
 class Log(nn.Module):
-    def forward(self, x, x_mask, reverse=False, **kwargs):
+    def forward(self, x, x_mask, reverse=False, **_kwargs):
         if not reverse:
             y = torch.log(torch.clamp_min(x, 1e-5)) * x_mask
-            logdet = torch.sum(-y, [1, 2])
-            return y, logdet
+            return y, torch.sum(-y, [1, 2])
         else:
-            x = torch.exp(x) * x_mask
-            return x
+            return torch.exp(x) * x_mask
 
 
 class Flip(nn.Module):
-    def forward(self, x, *args, reverse=False, **kwargs):
+    def forward(self, x, *_args, reverse=False, **_kwargs):
         x = torch.flip(x, [1])
         if not reverse:
-            logdet = torch.zeros(x.size(0)).to(dtype=x.dtype, device=x.device)
-            return x, logdet
+            return x, torch.zeros(x.size(0)).to(dtype=x.dtype, device=x.device)
         else:
             return x
 
@@ -388,15 +375,12 @@ class ElementwiseAffine(nn.Module):
         self.m = nn.Parameter(torch.zeros(channels, 1))
         self.logs = nn.Parameter(torch.zeros(channels, 1))
 
-    def forward(self, x, x_mask, reverse=False, **kwargs):
+    def forward(self, x, x_mask, reverse=False, **_kwargs):
         if not reverse:
-            y = self.m + torch.exp(self.logs) * x
-            y = y * x_mask
-            logdet = torch.sum(self.logs * x_mask, [1, 2])
-            return y, logdet
+            y = (self.m + torch.exp(self.logs) * x) * x_mask
+            return y, torch.sum(self.logs * x_mask, [1, 2])
         else:
-            x = (x - self.m) * torch.exp(-self.logs) * x_mask
-            return x
+            return (x - self.m) * torch.exp(-self.logs) * x_mask
 
 
 class ResidualCouplingLayer(nn.Module):
@@ -436,9 +420,7 @@ class ResidualCouplingLayer(nn.Module):
 
     def forward(self, x, x_mask, g=None, reverse=False):
         x0, x1 = torch.split(x, [self.half_channels] * 2, 1)
-        h = self.pre(x0) * x_mask
-        h = self.enc(h, x_mask, g=g)
-        stats = self.post(h) * x_mask
+        stats = self.post(self.enc(self.pre(x0) * x_mask, x_mask, g=g)) * x_mask
         if not self.mean_only:
             m, logs = torch.split(stats, [self.half_channels] * 2, 1)
         else:
@@ -447,13 +429,9 @@ class ResidualCouplingLayer(nn.Module):
 
         if not reverse:
             x1 = m + x1 * torch.exp(logs) * x_mask
-            x = torch.cat([x0, x1], 1)
-            logdet = torch.sum(logs, [1, 2])
-            return x, logdet
+            return torch.cat([x0, x1], 1), torch.sum(logs, [1, 2])
         else:
-            x1 = (x1 - m) * torch.exp(-logs) * x_mask
-            x = torch.cat([x0, x1], 1)
-            return x
+            return torch.cat([x0, (x1 - m) * torch.exp(-logs) * x_mask], 1)
 
 
 class ConvFlow(nn.Module):
@@ -485,9 +463,7 @@ class ConvFlow(nn.Module):
 
     def forward(self, x, x_mask, g=None, reverse=False):
         x0, x1 = torch.split(x, [self.half_channels] * 2, 1)
-        h = self.pre(x0)
-        h = self.convs(h, x_mask, g=g)
-        h = self.proj(h) * x_mask
+        h = self.proj(self.convs(self.pre(x0), x_mask, g=g)) * x_mask
 
         b, c, t = x0.shape
         h = h.reshape(b, c, -1, t).permute(0, 1, 3, 2)  # [b, cx?, t] -> [b, c, t, ?]
@@ -549,7 +525,6 @@ class TransformerCouplingLayer(nn.Module):
                 n_layers,
                 kernel_size,
                 p_dropout,
-                isflow=True,
                 gin_channels=gin_channels,
             )
             if wn_sharing_parameter is None
@@ -561,9 +536,7 @@ class TransformerCouplingLayer(nn.Module):
 
     def forward(self, x, x_mask, g=None, reverse=False):
         x0, x1 = torch.split(x, [self.half_channels] * 2, 1)
-        h = self.pre(x0) * x_mask
-        h = self.enc(h, x_mask, g=g)
-        stats = self.post(h) * x_mask
+        stats = self.post(self.enc(self.pre(x0) * x_mask, x_mask, g=g)) * x_mask
         if not self.mean_only:
             m, logs = torch.split(stats, [self.half_channels] * 2, 1)
         else:
@@ -572,27 +545,6 @@ class TransformerCouplingLayer(nn.Module):
 
         if not reverse:
             x1 = m + x1 * torch.exp(logs) * x_mask
-            x = torch.cat([x0, x1], 1)
-            logdet = torch.sum(logs, [1, 2])
-            return x, logdet
+            return torch.cat([x0, x1], 1), torch.sum(logs, [1, 2])
         else:
-            x1 = (x1 - m) * torch.exp(-logs) * x_mask
-            x = torch.cat([x0, x1], 1)
-            return x
-
-        x1, logabsdet = piecewise_rational_quadratic_transform(
-            x1,
-            unnormalized_widths,
-            unnormalized_heights,
-            unnormalized_derivatives,
-            inverse=reverse,
-            tails="linear",
-            tail_bound=self.tail_bound,
-        )
-
-        x = torch.cat([x0, x1], 1) * x_mask
-        logdet = torch.sum(logabsdet * x_mask, [1, 2])
-        if not reverse:
-            return x, logdet
-        else:
-            return x
+            return torch.cat([x0, (x1 - m) * torch.exp(-logs) * x_mask], 1)

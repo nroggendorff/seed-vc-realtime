@@ -29,9 +29,7 @@ def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):
     n_channels_int = n_channels[0]
     in_act = input_a + input_b
     t_act = torch.tanh(in_act[:, :n_channels_int, :])
-    s_act = torch.sigmoid(in_act[:, n_channels_int:, :])
-    acts = t_act * s_act
-    return acts
+    return t_act * torch.sigmoid(in_act[:, n_channels_int:, :])
 
 
 class Encoder(nn.Module):
@@ -44,7 +42,6 @@ class Encoder(nn.Module):
         kernel_size=1,
         p_dropout=0.0,
         window_size=4,
-        isflow=True,
         **kwargs
     ):
         super().__init__()
@@ -100,19 +97,14 @@ class Encoder(nn.Module):
         x = x * x_mask
         for i in range(self.n_layers):
             if i == self.cond_layer_idx and g is not None:
-                g = self.spk_emb_linear(g.transpose(1, 2))
-                g = g.transpose(1, 2)
-                x = x + g
-                x = x * x_mask
-            y = self.attn_layers[i](x, x, attn_mask)
-            y = self.drop(y)
+                g = self.spk_emb_linear(g.transpose(1, 2)).transpose(1, 2)
+                x = (x + g) * x_mask
+            y = self.drop(self.attn_layers[i](x, x, attn_mask))
             x = self.norm_layers_1[i](x + y)
 
-            y = self.ffn_layers[i](x, x_mask)
-            y = self.drop(y)
+            y = self.drop(self.ffn_layers[i](x, x_mask))
             x = self.norm_layers_2[i](x + y)
-        x = x * x_mask
-        return x
+        return x * x_mask
 
 
 class Decoder(nn.Module):
@@ -126,7 +118,7 @@ class Decoder(nn.Module):
         p_dropout=0.0,
         proximal_bias=False,
         proximal_init=True,
-        **kwargs
+        **_kwargs
     ):
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -186,19 +178,15 @@ class Decoder(nn.Module):
         encdec_attn_mask = h_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
         for i in range(self.n_layers):
-            y = self.self_attn_layers[i](x, x, self_attn_mask)
-            y = self.drop(y)
+            y = self.drop(self.self_attn_layers[i](x, x, self_attn_mask))
             x = self.norm_layers_0[i](x + y)
 
-            y = self.encdec_attn_layers[i](x, h, encdec_attn_mask)
-            y = self.drop(y)
+            y = self.drop(self.encdec_attn_layers[i](x, h, encdec_attn_mask))
             x = self.norm_layers_1[i](x + y)
 
-            y = self.ffn_layers[i](x, x_mask)
-            y = self.drop(y)
+            y = self.drop(self.ffn_layers[i](x, x_mask))
             x = self.norm_layers_2[i](x + y)
-        x = x * x_mask
-        return x
+        return x * x_mask
 
 
 class MultiHeadAttention(nn.Module):
@@ -257,13 +245,9 @@ class MultiHeadAttention(nn.Module):
 
     def forward(self, x, c, attn_mask=None):
         q = self.conv_q(x)
-        k = self.conv_k(c)
-        v = self.conv_v(c)
+        x, self.attn = self.attention(q, self.conv_k(c), self.conv_v(c), mask=attn_mask)
 
-        x, self.attn = self.attention(q, k, v, mask=attn_mask)
-
-        x = self.conv_o(x)
-        return x
+        return self.conv_o(x)
 
     def attention(self, query, key, value, mask=None):
         # reshape [b, d, t] -> [b, n_h, t, d_k]
@@ -281,8 +265,7 @@ class MultiHeadAttention(nn.Module):
             rel_logits = self._matmul_with_relative_keys(
                 query / math.sqrt(self.k_channels), key_relative_embeddings
             )
-            scores_local = self._relative_position_to_absolute_position(rel_logits)
-            scores = scores + scores_local
+            scores = scores + self._relative_position_to_absolute_position(rel_logits)
         if self.proximal_bias:
             assert t_s == t_t, "Proximal bias is only available for self-attention."
             scores = scores + self._attention_bias_proximal(t_s).to(
@@ -322,8 +305,7 @@ class MultiHeadAttention(nn.Module):
         y: [h or 1, m, d]
         ret: [b, h, l, d]
         """
-        ret = torch.matmul(x, y.unsqueeze(0))
-        return ret
+        return torch.matmul(x, y.unsqueeze(0))
 
     def _matmul_with_relative_keys(self, x, y):
         """
@@ -331,8 +313,7 @@ class MultiHeadAttention(nn.Module):
         y: [h or 1, m, d]
         ret: [b, h, l, m]
         """
-        ret = torch.matmul(x, y.unsqueeze(0).transpose(-2, -1))
-        return ret
+        return torch.matmul(x, y.unsqueeze(0).transpose(-2, -1))
 
     def _get_relative_embeddings(self, relative_embeddings, length):
         2 * self.window_size + 1
@@ -347,10 +328,7 @@ class MultiHeadAttention(nn.Module):
             )
         else:
             padded_relative_embeddings = relative_embeddings
-        used_relative_embeddings = padded_relative_embeddings[
-            :, slice_start_position:slice_end_position
-        ]
-        return used_relative_embeddings
+        return padded_relative_embeddings[:, slice_start_position:slice_end_position]
 
     def _relative_position_to_absolute_position(self, x):
         """
@@ -386,8 +364,7 @@ class MultiHeadAttention(nn.Module):
         x_flat = x.view([batch, heads, length**2 + length * (length - 1)])
         # add 0's in the beginning that will skew the elements after reshape
         x_flat = F.pad(x_flat, commons.convert_pad_shape([[0, 0], [0, 0], [length, 0]]))
-        x_final = x_flat.view([batch, heads, length, 2 * length])[:, :, :, 1:]
-        return x_final
+        return x_flat.view([batch, heads, length, 2 * length])[:, :, :, 1:]
 
     def _attention_bias_proximal(self, length):
         """Bias for self-attention to encourage attention to close positions.
@@ -436,24 +413,16 @@ class FFN(nn.Module):
             x = x * torch.sigmoid(1.702 * x)
         else:
             x = torch.relu(x)
-        x = self.drop(x)
-        x = self.conv_2(self.padding(x * x_mask))
-        return x * x_mask
+        return self.conv_2(self.padding(self.drop(x) * x_mask)) * x_mask
 
     def _causal_padding(self, x):
         if self.kernel_size == 1:
             return x
-        pad_l = self.kernel_size - 1
-        pad_r = 0
-        padding = [[0, 0], [0, 0], [pad_l, pad_r]]
-        x = F.pad(x, commons.convert_pad_shape(padding))
-        return x
+        padding = [[0, 0], [0, 0], [self.kernel_size - 1, 0]]
+        return F.pad(x, commons.convert_pad_shape(padding))
 
     def _same_padding(self, x):
         if self.kernel_size == 1:
             return x
-        pad_l = (self.kernel_size - 1) // 2
-        pad_r = self.kernel_size // 2
-        padding = [[0, 0], [0, 0], [pad_l, pad_r]]
-        x = F.pad(x, commons.convert_pad_shape(padding))
-        return x
+        padding = [[0, 0], [0, 0], [(self.kernel_size - 1) // 2, self.kernel_size // 2]]
+        return F.pad(x, commons.convert_pad_shape(padding))

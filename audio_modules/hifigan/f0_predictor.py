@@ -50,6 +50,4 @@ class ConvRNNF0Predictor(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.condnet(x)
-        x = x.transpose(1, 2)
-        return torch.abs(self.classifier(x).squeeze(-1))
+        return torch.abs(self.classifier(self.condnet(x).transpose(1, 2)).squeeze(-1))

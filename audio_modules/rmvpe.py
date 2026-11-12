@@ -88,8 +88,7 @@ class STFT(torch.nn.Module):
         imag_part = forward_transform[:, cutoff:, :]
         magnitude = torch.sqrt(real_part**2 + imag_part**2)
         if return_phase:
-            phase = torch.atan2(imag_part.data, real_part.data)
-            return magnitude, phase
+            return magnitude, torch.atan2(imag_part.data, real_part.data)
         else:
             return magnitude
 
@@ -139,8 +138,7 @@ class STFT(torch.nn.Module):
                 shape (num_batch, num_samples)
         """
         self.magnitude, self.phase = self.transform(input_data, return_phase=True)
-        reconstruction = self.inverse(self.magnitude, self.phase)
-        return reconstruction
+        return self.inverse(self.magnitude, self.phase)
 
 
 class BiGRU(nn.Module):
@@ -297,8 +295,7 @@ class ResDecoderBlock(nn.Module):
             self.conv2.append(ConvBlockRes(out_channels, out_channels, momentum))
 
     def forward(self, x, concat_tensor):
-        x = self.conv1(x)
-        x = torch.cat((x, concat_tensor), dim=1)
+        x = torch.cat((self.conv1(x), concat_tensor), dim=1)
         for i, conv2 in enumerate(self.conv2):
             x = conv2(x)
         return x
@@ -348,9 +345,7 @@ class DeepUnet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x, concat_tensors = self.encoder(x)
-        x = self.intermediate(x)
-        x = self.decoder(x, concat_tensors)
-        return x
+        return self.decoder(self.intermediate(x), concat_tensors)
 
 
 class E2E(nn.Module):
@@ -388,9 +383,7 @@ class E2E(nn.Module):
 
     def forward(self, mel):
         mel = mel.transpose(-1, -2).unsqueeze(1)
-        x = self.cnn(self.unet(mel)).transpose(1, 2).flatten(-2)
-        x = self.fc(x)
-        return x
+        return self.fc(self.cnn(self.unet(mel)).transpose(1, 2).flatten(-2))
 
 
 from librosa.filters import mel
@@ -469,12 +462,11 @@ class MelSpectrogram(torch.nn.Module):
         mel_output = torch.matmul(self.mel_basis, magnitude)
         if self.is_half == True:
             mel_output = mel_output.half()
-        log_mel_spec = torch.log(torch.clamp(mel_output, min=self.clamp))
-        return log_mel_spec
+        return torch.log(torch.clamp(mel_output, min=self.clamp))
 
 
 class RMVPE:
-    def __init__(self, model_path: str, is_half, device=None, use_jit=False):
+    def __init__(self, model_path: str, is_half, device=None):
         self.resample_kernel = {}
         self.resample_kernel = {}
         self.is_half = is_half
@@ -503,8 +495,7 @@ class RMVPE:
 
             def get_default_model():
                 model = E2E(4, 1, (2, 2))
-                ckpt = torch.load(model_path, map_location="cpu")
-                model.load_state_dict(ckpt)
+                model.load_state_dict(torch.load(model_path, map_location="cpu"))
                 model.eval()
                 if is_half:
                     model = model.half()
@@ -537,8 +528,7 @@ class RMVPE:
             return hidden[:, :n_frames]
 
     def decode(self, hidden, thred=0.03):
-        cents_pred = self.to_local_average_cents(hidden, thred=thred)
-        f0 = 10 * (2 ** (cents_pred / 1200))
+        f0 = 10 * (2 ** (self.to_local_average_cents(hidden, thred=thred) / 1200))
         f0[f0 == 10] = 0
         return f0
 
@@ -556,8 +546,7 @@ class RMVPE:
         if self.is_half == True:
             hidden = hidden.astype("float32")
 
-        f0 = self.decode(hidden, thred=thred)
-        return f0
+        return self.decode(hidden, thred=thred)
 
     def infer_from_audio_batch(self, audio, thred=0.03):
         if not torch.is_tensor(audio):
@@ -574,9 +563,7 @@ class RMVPE:
         f0s = []
         for bib in range(hidden.shape[0]):
             f0s.append(self.decode(hidden[bib], thred=thred))
-        f0s = np.stack(f0s)
-        f0s = torch.from_numpy(f0s).to(self.device)
-        return f0s
+        return torch.from_numpy(np.stack(f0s)).to(self.device)
 
     def to_local_average_cents(self, salience, thred=0.05):
         center = np.argmax(salience, axis=1)  # (n_frames,)

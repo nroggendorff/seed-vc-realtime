@@ -68,12 +68,8 @@ def _get_cuda_bare_metal_version(cuda_dir):
         [cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True
     )
     output = raw_output.split()
-    release_idx = output.index("release") + 1
-    release = output[release_idx].split(".")
-    bare_metal_major = release[0]
-    bare_metal_minor = release[1][0]
-
-    return raw_output, bare_metal_major, bare_metal_minor
+    release = output[output.index("release") + 1].split(".")
+    return raw_output, release[0], release[1][0]
 
 
 def _create_build_dir(buildpath):

@@ -40,8 +40,7 @@ def maybe_distributed_mean(t):
         return t
 
     dist_nn.all_reduce(t)
-    t = t / dist.get_world_size()
-    return t
+    return t / dist.get_world_size()
 
 
 def exists(v):
@@ -86,9 +85,7 @@ class CosineSimLinear(Module):
         self.weight = nn.Parameter(torch.randn(dim_in, dim_out))
 
     def forward(self, x):
-        x = F.normalize(x, dim=-1)
-        w = F.normalize(self.weight, dim=0)
-        return (x @ w) * self.scale
+        return (F.normalize(x, dim=-1) @ F.normalize(self.weight, dim=0)) * self.scale
 
 
 def soft_entropy_loss(u, tau=1.0, gamma=1.0):
@@ -121,8 +118,7 @@ def soft_entropy_loss(u, tau=1.0, gamma=1.0):
     expected_probs = prob_matrix.mean(dim=0)  # Mean across batch, shape: (L, 2)
     entropy_term2 = -torch.sum(expected_probs * expected_probs.log(), dim=-1).mean()
 
-    loss = entropy_term1 - gamma * entropy_term2
-    return loss
+    return entropy_term1 - gamma * entropy_term2
 
 
 class BinarySphericalQuantize(Module):
@@ -261,9 +257,7 @@ class BinarySphericalQuantize(Module):
 
         bits = ((indices[..., None].int() & self.mask) != 0).to(self.dtype)
 
-        codes = self.bits_to_codes(bits)
-
-        codes = self.maybe_l2norm(codes)
+        codes = self.maybe_l2norm(self.bits_to_codes(bits))
 
         codes = rearrange(codes, "... c d -> ... (c d)")
 
@@ -280,10 +274,7 @@ class BinarySphericalQuantize(Module):
 
     def bits_to_z(self, bits):
         assert torch.all(bits.abs() == 1)
-        quantized = bits.float()
-        quantized = self.maybe_l2norm(quantized)
-        z = self.project_out(quantized)
-        return z
+        return self.project_out(self.maybe_l2norm(bits.float()))
 
     def forward(
         self,
@@ -301,8 +292,7 @@ class BinarySphericalQuantize(Module):
         c - number of codebook dim
         """
 
-        is_img_or_video = x.ndim >= 4
-        should_transpose = default(self.channel_first, is_img_or_video)
+        should_transpose = default(self.channel_first, x.ndim >= 4)
 
         # standardize image or video into (batch, seq, dimension)
 
@@ -395,9 +385,7 @@ class BinarySphericalQuantize(Module):
                         "... i d, j d -> ... i j", original_input, codebook
                     )
 
-                    prob = (-distance * inv_temperature).softmax(dim=-1)
-
-                    per_sample_probs = prob
+                    per_sample_probs = (-distance * inv_temperature).softmax(dim=-1)
 
                 per_sample_entropy = entropy(per_sample_probs).mean()
 
@@ -439,13 +427,10 @@ class BinarySphericalQuantize(Module):
             if force_f32:
                 x = x.type(orig_dtype)
 
-        x = rearrange(x, "b n c d -> b n (c d)")
-
-        x = self.project_out(x)
+        x = self.project_out(rearrange(x, "b n c d -> b n (c d)"))
 
         if should_transpose:
-            x = unpack_one(x, ps, "b * d")
-            x = rearrange(x, "b ... d -> b d ...")
+            x = rearrange(unpack_one(x, ps, "b * d"), "b ... d -> b d ...")
 
             indices = unpack_one(indices, ps, "b * c")
 
@@ -463,62 +448,3 @@ class BinarySphericalQuantize(Module):
             return ret
 
         return ret, LossBreakdown(per_sample_entropy, codebook_entropy, commit_loss)
-
-
-class GroupedResidualBSQ(Module):
-    def __init__(self, *, dim, groups=1, accept_image_fmap=False, **kwargs):
-        super().__init__()
-        self.dim = dim
-        self.groups = groups
-        assert (dim % groups) == 0
-        dim_per_group = dim // groups
-
-        self.accept_image_fmap = accept_image_fmap
-
-        self.rvqs = nn.ModuleList([])
-
-        for _ in range(groups):
-            self.rvqs.append(LFQ(dim=dim_per_group, **kwargs))
-
-        self.codebook_size = self.rvqs[0].codebook_size
-
-    @property
-    def codebooks(self):
-        return torch.stack(tuple(rvq.codebooks for rvq in self.rvqs))
-
-    @property
-    def split_dim(self):
-        return 1 if self.accept_image_fmap else -1
-
-    def get_codes_from_indices(self, indices):
-        codes = tuple(
-            rvq.get_codes_from_indices(chunk_indices)
-            for rvq, chunk_indices in zip(self.rvqs, indices)
-        )
-        return torch.stack(codes)
-
-    def get_output_from_indices(self, indices):
-        outputs = tuple(
-            rvq.get_output_from_indices(chunk_indices)
-            for rvq, chunk_indices in zip(self.rvqs, indices)
-        )
-        return torch.cat(outputs, dim=self.split_dim)
-
-    def forward(self, x, return_all_codes=False):
-        shape, split_dim = x.shape, self.split_dim
-        assert shape[split_dim] == self.dim
-
-        x = x.chunk(self.groups, dim=split_dim)
-
-        forward_kwargs = dict()
-
-        out = tuple(rvq(chunk, **forward_kwargs) for rvq, chunk in zip(self.rvqs, x))
-        out = tuple(zip(*out))
-
-        quantized, all_indices, *maybe_aux_loss = out
-
-        quantized = torch.cat(quantized, dim=split_dim)
-        all_indices = torch.stack(all_indices)
-
-        ret = (quantized, all_indices, *maybe_aux_loss)
-        return ret

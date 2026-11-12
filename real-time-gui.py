@@ -69,7 +69,7 @@ class GUI:
         except Exception as e:
             print(f"Failed to publish audio delay to SHM: {e}")
 
-    def update_perf_stats(self, infer_time, delay_time, measured_delay_time):
+    def update_perf_stats(self, infer_time, _delay_time, measured_delay_time):
         """Callback to update UI with performance stats"""
         # Publish every callback (cheap) so the video process tracks latency promptly; the UI update below stays throttled.
         self.publish_audio_delay(measured_delay_time)
@@ -447,8 +447,7 @@ class GUI:
         if len(values["reference_audio_path"].strip()) == 0:
             sg.popup("Choose an audio file")
             return False
-        pattern = re.compile("[^\x00-\x7f]+")
-        if pattern.findall(values["reference_audio_path"]):
+        if re.compile("[^\x00-\x7f]+").findall(values["reference_audio_path"]):
             sg.popup("audio file path contains non-ascii characters")
             return False
 

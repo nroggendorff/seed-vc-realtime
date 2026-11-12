@@ -52,9 +52,7 @@ class VoiceConversionWrapper(torch.nn.Module):
         self.ar_max_content_len = 1500  # in num of narrow tokens
         self.compile_len = 87 * self.dit_max_context_len
 
-    def forward_cfm(
-        self, content_indices_wide, content_lens, mels, mel_lens, style_vectors
-    ):
+    def forward_cfm(self, content_indices_wide, mels, mel_lens, style_vectors):
         device = content_indices_wide.device
         B = content_indices_wide.size(0)
         cond, _ = self.cfm_length_regulator(content_indices_wide, ylens=mel_lens)
@@ -68,8 +66,7 @@ class VoiceConversionWrapper(torch.nn.Module):
         )
         prompt_len[torch.rand([B], device=device) < 0.1] = 0
 
-        loss = self.cfm(mels, mel_lens, prompt_len, cond, style_vectors)
-        return loss
+        return self.cfm(mels, mel_lens, prompt_len, cond, style_vectors)
 
     def forward_ar(self, content_indices_narrow, content_indices_wide, content_lens):
         device = content_indices_narrow.device
@@ -128,7 +125,7 @@ class VoiceConversionWrapper(torch.nn.Module):
         if forward_cfm:
             style_vectors = self.compute_style(waves_16k, wave_lens_16k)
             loss_cfm = self.forward_cfm(
-                content_indices_wide, content_lens, mels, mel_lens, style_vectors
+                content_indices_wide, mels, mel_lens, style_vectors
             )
         else:
             loss_cfm = torch.tensor(0.0, device=waves_16k.device, dtype=waves_16k.dtype)
@@ -454,9 +451,7 @@ class VoiceConversionWrapper(torch.nn.Module):
             )
             for feat in feat_list
         ]
-        feat = torch.stack(feat_list, dim=0)
-        style = self.style_encoder(feat, feat_lens)
-        return style
+        return self.style_encoder(torch.stack(feat_list, dim=0), feat_lens)
 
     @torch.no_grad()
     @torch.inference_mode()
@@ -465,7 +460,6 @@ class VoiceConversionWrapper(torch.nn.Module):
         source_audio_path: str,
         target_audio_path: str,
         diffusion_steps: int = 30,
-        length_adjust: float = 1.0,
         inference_cfg_rate: float = 0.5,
         use_sway_sampling: bool = False,
         use_amo_sampling: bool = False,
@@ -525,8 +519,7 @@ class VoiceConversionWrapper(torch.nn.Module):
                 amo_sampling=use_amo_sampling,
             )
         vc_mel = vc_mel[:, :, target_mel_len:]
-        vc_wave = self.vocoder(vc_mel.float()).squeeze()[None]
-        return vc_wave.cpu().numpy()
+        return self.vocoder(vc_mel.float()).squeeze()[None].cpu().numpy()
 
     @torch.no_grad()
     @torch.inference_mode()
@@ -636,8 +629,7 @@ class VoiceConversionWrapper(torch.nn.Module):
                 amo_sampling=use_amo_sampling,
             )
         vc_mel = vc_mel[:, :, target_mel_len:]
-        vc_wave = self.vocoder(vc_mel.float()).squeeze()[None]
-        return vc_wave.cpu().numpy()
+        return self.vocoder(vc_mel.float()).squeeze()[None].cpu().numpy()
 
     def _process_content_features(self, audio_16k_tensor, is_narrow=False):
         """Process audio through Whisper model to extract features."""

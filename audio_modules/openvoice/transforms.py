@@ -150,8 +150,7 @@ def rational_quadratic_spline(
     input_bin_widths = widths.gather(-1, bin_idx)[..., 0]
 
     input_cumheights = cumheights.gather(-1, bin_idx)[..., 0]
-    delta = heights / widths
-    input_delta = delta.gather(-1, bin_idx)[..., 0]
+    input_delta = (heights / widths).gather(-1, bin_idx)[..., 0]
 
     input_derivatives = derivatives.gather(-1, bin_idx)[..., 0]
     input_derivatives_plus_one = derivatives[..., 1:].gather(-1, bin_idx)[..., 0]
@@ -183,9 +182,7 @@ def rational_quadratic_spline(
             + 2 * input_delta * theta_one_minus_theta
             + input_derivatives * (1 - root).pow(2)
         )
-        logabsdet = torch.log(derivative_numerator) - 2 * torch.log(denominator)
-
-        return outputs, -logabsdet
+        return outputs, -(torch.log(derivative_numerator) - 2 * torch.log(denominator))
     else:
         theta = (inputs - input_cumwidths) / input_bin_widths
         theta_one_minus_theta = theta * (1 - theta)
@@ -204,6 +201,4 @@ def rational_quadratic_spline(
             + 2 * input_delta * theta_one_minus_theta
             + input_derivatives * (1 - theta).pow(2)
         )
-        logabsdet = torch.log(derivative_numerator) - 2 * torch.log(denominator)
-
-        return outputs, logabsdet
+        return outputs, torch.log(derivative_numerator) - 2 * torch.log(denominator)

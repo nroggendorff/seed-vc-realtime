@@ -29,8 +29,7 @@ class ConvNextV2LayerNorm(nn.Module):
             input_dtype = x.dtype
             x = x.float()
             u = x.mean(1, keepdim=True)
-            s = (x - u).pow(2).mean(1, keepdim=True)
-            x = (x - u) / torch.sqrt(s + self.eps)
+            x = (x - u) / torch.sqrt((x - u).pow(2).mean(1, keepdim=True) + self.eps)
             x = x.to(dtype=input_dtype)
             x = self.weight[None, :, None] * x + self.bias[None, :, None]
         return x
@@ -56,10 +55,9 @@ class InterpolationLayer(nn.Module):
         pass
 
     def forward(
-        self, x: torch.Tensor, target_len: torch.Tensor, *args, **kwargs
+        self, x: torch.Tensor, target_len: torch.Tensor, *_args, **_kwargs
     ) -> torch.Tensor:
-        x = F.interpolate(x, size=target_len, mode="linear")
-        return x
+        return F.interpolate(x, size=target_len, mode="linear")
 
 
 class ConvNeXtV2Stage(nn.Module):
@@ -156,11 +154,10 @@ class ConvNeXtV2Stage(nn.Module):
         if gin_channels > 0:
             self.gin = nn.Conv1d(gin_channels, dim, kernel_size=1)
 
-    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *_args, **kwargs) -> torch.Tensor:
         x = self.input_projection(x)  # B, D, T
         if hasattr(self, "gin"):
-            g = kwargs["g"]
-            x = x + self.gin(g)
+            x = x + self.gin(kwargs["g"])
         # pad to a multiple of cumprod(downsample_factors)
         if len(self.downsample_blocks) > 0:
             downsample_factor = 1
@@ -184,8 +181,7 @@ class ConvNeXtV2Stage(nn.Module):
                     self.interpolation_layer_indices.index(layer_idx)
                 ](x, target_len=kwargs["target_len"])
             x = block(x)
-        x = self.output_projection(x)
-        return x
+        return self.output_projection(x)
 
     def setup_caches(self, *args, **kwargs):
         pass
@@ -213,12 +209,8 @@ class ConvNeXtV2Block(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
-        x = self.dwconv(x)
-        x = self.norm(x)
+        x = self.norm(self.dwconv(x))
         x = x.transpose(1, 2)  # b d n -> b n d
-        x = self.pwconv1(x)
-        x = self.act(x)
-        x = self.grn(x)
-        x = self.pwconv2(x)
+        x = self.pwconv2(self.grn(self.act(self.pwconv1(x))))
         x = x.transpose(1, 2)  # b n d -> b d n
         return residual + x

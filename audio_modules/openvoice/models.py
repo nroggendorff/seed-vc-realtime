@@ -51,9 +51,7 @@ class TextEncoder(nn.Module):
         )
 
         x = self.encoder(x * x_mask, x_mask)
-        stats = self.proj(x) * x_mask
-
-        m, logs = torch.split(stats, self.out_channels, dim=1)
+        m, logs = torch.split(self.proj(x) * x_mask, self.out_channels, dim=1)
         return x, m, logs, x_mask
 
 
@@ -88,16 +86,9 @@ class DurationPredictor(nn.Module):
         if g is not None:
             g = torch.detach(g)
             x = x + self.cond(g)
-        x = self.conv_1(x * x_mask)
-        x = torch.relu(x)
-        x = self.norm_1(x)
-        x = self.drop(x)
-        x = self.conv_2(x * x_mask)
-        x = torch.relu(x)
-        x = self.norm_2(x)
-        x = self.drop(x)
-        x = self.proj(x * x_mask)
-        return x * x_mask
+        x = self.drop(self.norm_1(torch.relu(self.conv_1(x * x_mask))))
+        x = self.drop(self.norm_2(torch.relu(self.conv_2(x * x_mask))))
+        return self.proj(x * x_mask) * x_mask
 
 
 class StochasticDurationPredictor(nn.Module):
@@ -150,22 +141,18 @@ class StochasticDurationPredictor(nn.Module):
             self.cond = nn.Conv1d(gin_channels, filter_channels, 1)
 
     def forward(self, x, x_mask, w=None, g=None, reverse=False, noise_scale=1.0):
-        x = torch.detach(x)
-        x = self.pre(x)
+        x = self.pre(torch.detach(x))
         if g is not None:
             g = torch.detach(g)
             x = x + self.cond(g)
-        x = self.convs(x, x_mask)
-        x = self.proj(x) * x_mask
+        x = self.proj(self.convs(x, x_mask)) * x_mask
 
         if not reverse:
             flows = self.flows
             assert w is not None
 
             logdet_tot_q = 0
-            h_w = self.post_pre(w)
-            h_w = self.post_convs(h_w, x_mask)
-            h_w = self.post_proj(h_w) * x_mask
+            h_w = self.post_proj(self.post_convs(self.post_pre(w), x_mask)) * x_mask
             e_q = (
                 torch.randn(w.size(0), 2, w.size(2)).to(device=x.device, dtype=x.dtype)
                 * x_mask
@@ -175,8 +162,7 @@ class StochasticDurationPredictor(nn.Module):
                 z_q, logdet_q = flow(z_q, x_mask, g=(x + h_w))
                 logdet_tot_q += logdet_q
             z_u, z1 = torch.split(z_q, [1, 1], 1)
-            u = torch.sigmoid(z_u) * x_mask
-            z0 = (w - u) * x_mask
+            z0 = (w - torch.sigmoid(z_u) * x_mask) * x_mask
             logdet_tot_q += torch.sum(
                 (F.logsigmoid(z_u) + F.logsigmoid(-z_u)) * x_mask, [1, 2]
             )
@@ -207,8 +193,7 @@ class StochasticDurationPredictor(nn.Module):
             for flow in flows:
                 z = flow(z, x_mask, g=x, reverse=reverse)
             z0, z1 = torch.split(z, [1, 1], 1)
-            logw = z0
-            return logw
+            return z0
 
 
 class PosteriorEncoder(nn.Module):
@@ -245,10 +230,8 @@ class PosteriorEncoder(nn.Module):
         x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(
             x.dtype
         )
-        x = self.pre(x) * x_mask
-        x = self.enc(x, x_mask, g=g)
-        stats = self.proj(x) * x_mask
-        m, logs = torch.split(stats, self.out_channels, dim=1)
+        x = self.enc(self.pre(x) * x_mask, x_mask, g=g)
+        m, logs = torch.split(self.proj(x) * x_mask, self.out_channels, dim=1)
         z = (m + torch.randn_like(m) * tau * torch.exp(logs)) * x_mask
         return z, m, logs, x_mask
 
@@ -307,8 +290,7 @@ class Generator(torch.nn.Module):
             x = x + self.cond(g)
 
         for i in range(self.num_upsamples):
-            x = F.leaky_relu(x, modules.LRELU_SLOPE)
-            x = self.ups[i](x)
+            x = self.ups[i](F.leaky_relu(x, modules.LRELU_SLOPE))
             xs = None
             for j in range(self.num_kernels):
                 if xs is None:
@@ -316,11 +298,7 @@ class Generator(torch.nn.Module):
                 else:
                     xs += self.resblocks[i * self.num_kernels + j](x)
             x = xs / self.num_kernels
-        x = F.leaky_relu(x)
-        x = self.conv_post(x)
-        x = torch.tanh(x)
-
-        return x
+        return torch.tanh(self.conv_post(F.leaky_relu(x)))
 
     def remove_weight_norm(self):
         print("Removing weight norm...")
@@ -368,7 +346,7 @@ class ReferenceEncoder(nn.Module):
         else:
             self.layernorm = None
 
-    def forward(self, inputs, mask=None):
+    def forward(self, inputs):
         N = inputs.size(0)
 
         out = inputs.view(N, 1, -1, self.spec_channels)  # [N, 1, Ty, n_freqs]
@@ -465,7 +443,7 @@ class SynthesizerTrn(nn.Module):
         n_speakers=256,
         gin_channels=256,
         zero_g=False,
-        **kwargs
+        **_kwargs
     ):
         super().__init__()
 
@@ -537,8 +515,7 @@ class SynthesizerTrn(nn.Module):
             x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w
         ) * sdp_ratio + self.dp(x, x_mask, g=g) * (1 - sdp_ratio)
 
-        w = torch.exp(logw) * x_mask * length_scale
-        w_ceil = torch.ceil(w)
+        w_ceil = torch.ceil(torch.exp(logw) * x_mask * length_scale)
         y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
         y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(
             x_mask.dtype

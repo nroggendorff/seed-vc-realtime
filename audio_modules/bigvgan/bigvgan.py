@@ -129,11 +129,7 @@ class AMPBlock1(torch.nn.Module):
     def forward(self, x):
         acts1, acts2 = self.activations[::2], self.activations[1::2]
         for c1, c2, a1, a2 in zip(self.convs1, self.convs2, acts1, acts2):
-            xt = a1(x)
-            xt = c1(xt)
-            xt = a2(xt)
-            xt = c2(xt)
-            x = xt + x
+            x = c2(a2(c1(a1(x)))) + x
 
         return x
 
@@ -227,9 +223,7 @@ class AMPBlock2(torch.nn.Module):
 
     def forward(self, x):
         for c, a in zip(self.convs, self.activations):
-            xt = a(x)
-            xt = c(xt)
-            x = xt + x
+            x = c(a(x)) + x
 
     def remove_weight_norm(self):
         for l in self.convs:
@@ -364,8 +358,7 @@ class BigVGAN(
                     xs += self.resblocks[i * self.num_kernels + j](x)
             x = xs / self.num_kernels
 
-        x = self.activation_post(x)
-        x = self.conv_post(x)
+        x = self.conv_post(self.activation_post(x))
         if self.use_tanh_at_final:
             x = torch.tanh(x)
         else:
@@ -394,8 +387,7 @@ class BigVGAN(
         model_path = save_directory / "bigvgan_generator.pt"
         torch.save({"generator": self.state_dict()}, model_path)
 
-        config_path = save_directory / "config.json"
-        with open(config_path, "w") as config_file:
+        with open(save_directory / "config.json", "w") as config_file:
             json.dump(self.h, config_file, indent=4)
 
     @classmethod
@@ -411,9 +403,9 @@ class BigVGAN(
         local_files_only: bool,
         token: Union[str, bool, None],
         map_location: str = "cpu",
-        strict: bool = False,
+        strict: bool = False,  # noqa: ARG003 - huggingface_hub passes it by keyword
         use_cuda_kernel: bool = False,
-        **model_kwargs,
+        **_model_kwargs,
     ):
         """Load Pytorch pretrained weights and return the loaded model."""
 
@@ -436,13 +428,13 @@ class BigVGAN(
 
         if use_cuda_kernel:
             print(
-                f"[WARNING] You have specified use_cuda_kernel=True during BigVGAN.from_pretrained(). Only inference is supported (training is not implemented)!"
+                "[WARNING] You have specified use_cuda_kernel=True during BigVGAN.from_pretrained(). Only inference is supported (training is not implemented)!"
             )
             print(
-                f"[WARNING] You need nvcc and ninja installed in your system that matches your PyTorch build is using to build the kernel. If not, the model will fail to initialize or generate incorrect waveform!"
+                "[WARNING] You need nvcc and ninja installed in your system that matches your PyTorch build is using to build the kernel. If not, the model will fail to initialize or generate incorrect waveform!"
             )
             print(
-                f"[WARNING] For detail, see the official GitHub repository: https://github.com/NVIDIA/BigVGAN?tab=readme-ov-file#using-custom-cuda-kernel-for-synthesis"
+                "[WARNING] For detail, see the official GitHub repository: https://github.com/NVIDIA/BigVGAN?tab=readme-ov-file#using-custom-cuda-kernel-for-synthesis"
             )
         model = cls(h, use_cuda_kernel=use_cuda_kernel)
 
@@ -469,7 +461,7 @@ class BigVGAN(
             model.load_state_dict(checkpoint_dict["generator"])
         except RuntimeError:
             print(
-                f"[INFO] the pretrained checkpoint does not contain weight norm. Loading the checkpoint after removing weight norm!"
+                "[INFO] the pretrained checkpoint does not contain weight norm. Loading the checkpoint after removing weight norm!"
             )
             model.remove_weight_norm()
             model.load_state_dict(checkpoint_dict["generator"])

@@ -35,7 +35,6 @@ class BASECFM(torch.nn.Module, ABC):
         x_lens,
         prompt,
         style,
-        f0,
         n_timesteps,
         temperature=1.0,
         inference_cfg_rate=0.5,
@@ -61,12 +60,10 @@ class BASECFM(torch.nn.Module, ABC):
         z = torch.randn([B, self.in_channels, T], device=mu.device) * temperature
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)
         return self.solve_euler(
-            z, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate
+            z, x_lens, prompt, mu, style, t_span, inference_cfg_rate
         )
 
-    def solve_euler(
-        self, x, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate=0.5
-    ):
+    def solve_euler(self, x, x_lens, prompt, mu, style, t_span, inference_cfg_rate=0.5):
         """
         Fixed euler solver for ODEs.
         Args:

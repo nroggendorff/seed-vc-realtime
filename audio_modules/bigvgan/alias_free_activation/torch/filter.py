@@ -34,8 +34,7 @@ def kaiser_sinc_filter1d(
     half_size = kernel_size // 2
 
     # For kaiser window
-    delta_f = 4 * half_width
-    A = 2.285 * (half_size - 1) * math.pi * delta_f + 7.95
+    A = 2.285 * (half_size - 1) * math.pi * (4 * half_width) + 7.95
     if A > 50.0:
         beta = 0.1102 * (A - 8.7)
     elif A >= 21.0:
@@ -96,6 +95,4 @@ class LowPassFilter1d(nn.Module):
 
         if self.padding:
             x = F.pad(x, (self.pad_left, self.pad_right), mode=self.padding_mode)
-        out = F.conv1d(x, self.filter.expand(C, -1, -1), stride=self.stride, groups=C)
-
-        return out
+        return F.conv1d(x, self.filter.expand(C, -1, -1), stride=self.stride, groups=C)

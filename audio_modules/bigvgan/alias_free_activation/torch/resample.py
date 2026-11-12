@@ -33,9 +33,7 @@ class UpSample1d(nn.Module):
         x = self.ratio * F.conv_transpose1d(
             x, self.filter.expand(C, -1, -1), stride=self.stride, groups=C
         )
-        x = x[..., self.pad_left : -self.pad_right]
-
-        return x
+        return x[..., self.pad_left : -self.pad_right]
 
 
 class DownSample1d(nn.Module):
@@ -53,6 +51,4 @@ class DownSample1d(nn.Module):
         )
 
     def forward(self, x):
-        xx = self.lowpass(x)
-
-        return xx
+        return self.lowpass(x)

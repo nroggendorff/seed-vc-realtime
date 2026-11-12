@@ -122,10 +122,7 @@ def mel_spectrogram(
     )
     spec = torch.sqrt(torch.view_as_real(spec).pow(2).sum(-1) + 1e-9)
 
-    mel_spec = torch.matmul(mel_basis, spec)
-    mel_spec = spectral_normalize_torch(mel_spec)
-
-    return mel_spec
+    return spectral_normalize_torch(torch.matmul(mel_basis, spec))
 
 
 def get_mel_spectrogram(wav, h):
@@ -260,14 +257,12 @@ class MelDataset(torch.utils.data.Dataset):
             audio = self.cached_wav
             self._cache_ref_count -= 1
 
-        audio = torch.FloatTensor(audio)
-        audio = audio.unsqueeze(0)
+        audio = torch.FloatTensor(audio).unsqueeze(0)
 
         if not self.fine_tuning:
             if self.split:
                 if audio.size(1) >= self.segment_size:
-                    max_audio_start = audio.size(1) - self.segment_size
-                    audio_start = random.randint(0, max_audio_start)
+                    audio_start = random.randint(0, audio.size(1) - self.segment_size)
                     audio = audio[:, audio_start : audio_start + self.segment_size]
                 else:
                     audio = torch.nn.functional.pad(

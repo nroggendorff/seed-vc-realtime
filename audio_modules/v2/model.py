@@ -60,9 +60,7 @@ class ModelArgs:
         if self.n_local_heads == -1:
             self.n_local_heads = self.n_head
         if self.intermediate_size is None:
-            hidden_dim = 4 * self.dim
-            n_hidden = int(2 * hidden_dim / 3)
-            self.intermediate_size = find_multiple(n_hidden, 256)
+            self.intermediate_size = find_multiple(int(2 * (4 * self.dim) / 3), 256)
 
 
 class Transformer(nn.Module):
@@ -128,8 +126,7 @@ class Transformer(nn.Module):
             if not self.training and self.use_kv_cache:
                 mask = self.causal_mask[None, None, input_pos]
             else:
-                mask = self.causal_mask[None, None, input_pos]
-                mask = mask[..., input_pos]
+                mask = self.causal_mask[None, None, input_pos][..., input_pos]
         freqs_cis = self.freqs_cis[input_pos]
         if context is not None:
             context_freqs_cis = self.freqs_cis[context_input_pos]
@@ -154,8 +151,7 @@ class Transformer(nn.Module):
             )
             if self.uvit_skip_connection and i in self.layers_emit_skip:
                 skip_in_x_list.append(x)
-        x = self.norm(x, c)
-        return x
+        return self.norm(x, c)
 
     @classmethod
     def from_name(cls, name: str):
@@ -216,8 +212,7 @@ class TransformerBlock(nn.Module):
                 context,
                 context_freqs_cis,
             )
-        out = h + self.feed_forward(self.ffn_norm(h, c))
-        return out
+        return h + self.feed_forward(self.ffn_norm(h, c))
 
 
 class Attention(nn.Module):
@@ -288,8 +283,7 @@ class Attention(nn.Module):
             .view(bsz, seqlen, self.head_dim * self.n_head)
         )
 
-        y = self.wo(y)
-        return y
+        return self.wo(y)
 
 
 class FeedForward(nn.Module):
@@ -313,8 +307,7 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x: Tensor) -> Tensor:
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        return self._norm(x.float()).type_as(x) * self.weight
 
 
 def precompute_freqs_cis(
@@ -323,11 +316,9 @@ def precompute_freqs_cis(
     freqs = 1.0 / (
         base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem)
     )
-    t = torch.arange(seq_len, device=freqs.device)
-    freqs = torch.outer(t, freqs)
+    freqs = torch.outer(torch.arange(seq_len, device=freqs.device), freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-    cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
-    return cache.to(dtype=dtype)
+    return torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1).to(dtype=dtype)
 
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
@@ -341,5 +332,4 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
         -1,
     )
 
-    x_out2 = x_out2.flatten(3)
-    return x_out2.type_as(x)
+    return x_out2.flatten(3).type_as(x)

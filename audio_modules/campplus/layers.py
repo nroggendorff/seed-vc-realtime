@@ -23,24 +23,19 @@ def get_nonlinear(config_str, channels):
     return nonlinear
 
 
-def statistics_pooling(x, dim=-1, keepdim=False, unbiased=True, eps=1e-2):
-    mean = x.mean(dim=dim)
-    std = x.std(dim=dim, unbiased=unbiased)
-    stats = torch.cat([mean, std], dim=-1)
+def statistics_pooling(x, dim=-1, keepdim=False, unbiased=True):
+    stats = torch.cat([x.mean(dim=dim), x.std(dim=dim, unbiased=unbiased)], dim=-1)
     if keepdim:
         stats = stats.unsqueeze(dim=dim)
     return stats
 
 
-def masked_statistics_pooling(
-    x, x_lens, dim=-1, keepdim=False, unbiased=True, eps=1e-2
-):
+def masked_statistics_pooling(x, x_lens, dim=-1, keepdim=False, unbiased=True):
     stats = []
     for i, x_len in enumerate(x_lens):
         x_i = x[i, :, :x_len]
         mean = x_i.mean(dim=dim)
-        std = x_i.std(dim=dim, unbiased=unbiased)
-        stats.append(torch.cat([mean, std], dim=-1))
+        stats.append(torch.cat([mean, x_i.std(dim=dim, unbiased=unbiased)], dim=-1))
     stats = torch.stack(stats, dim=0)
     if keepdim:
         stats = stats.unsqueeze(dim=dim)
@@ -86,9 +81,7 @@ class TDNNLayer(nn.Module):
         self.nonlinear = get_nonlinear(config_str, out_channels)
 
     def forward(self, x):
-        x = self.linear(x)
-        x = self.nonlinear(x)
-        return x
+        return self.nonlinear(self.linear(x))
 
 
 class CAMLayer(nn.Module):
@@ -121,9 +114,7 @@ class CAMLayer(nn.Module):
     def forward(self, x):
         y = self.linear_local(x)
         context = x.mean(-1, keepdim=True) + self.seg_pooling(x)
-        context = self.relu(self.linear1(context))
-        m = self.sigmoid(self.linear2(context))
-        return y * m
+        return y * self.sigmoid(self.linear2(self.relu(self.linear1(context))))
 
     def seg_pooling(self, x, seg_len=100, stype="avg"):
         if stype == "avg":
@@ -134,8 +125,7 @@ class CAMLayer(nn.Module):
             raise ValueError("Wrong segment pooling type.")
         shape = seg.shape
         seg = seg.unsqueeze(-1).expand(*shape, seg_len).reshape(*shape[:-1], -1)
-        seg = seg[..., : x.shape[-1]]
-        return seg
+        return seg[..., : x.shape[-1]]
 
 
 class CAMDenseTDNNLayer(nn.Module):
@@ -178,8 +168,7 @@ class CAMDenseTDNNLayer(nn.Module):
             x = cp.checkpoint(self.bn_function, x)
         else:
             x = self.bn_function(x)
-        x = self.cam_layer(self.nonlinear2(x))
-        return x
+        return self.cam_layer(self.nonlinear2(x))
 
 
 class CAMDenseTDNNBlock(nn.ModuleList):
@@ -226,9 +215,7 @@ class TransitLayer(nn.Module):
         self.linear = nn.Conv1d(in_channels, out_channels, 1, bias=bias)
 
     def forward(self, x):
-        x = self.nonlinear(x)
-        x = self.linear(x)
-        return x
+        return self.linear(self.nonlinear(x))
 
 
 class DenseLayer(nn.Module):
@@ -244,8 +231,7 @@ class DenseLayer(nn.Module):
             x = self.linear(x.unsqueeze(dim=-1)).squeeze(dim=-1)
         else:
             x = self.linear(x)
-        x = self.nonlinear(x)
-        return x
+        return self.nonlinear(x)
 
 
 class BasicResBlock(nn.Module):
@@ -276,8 +262,6 @@ class BasicResBlock(nn.Module):
             )
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+        out = self.bn2(self.conv2(F.relu(self.bn1(self.conv1(x)))))
         out += self.shortcut(x)
-        out = F.relu(out)
-        return out
+        return F.relu(out)

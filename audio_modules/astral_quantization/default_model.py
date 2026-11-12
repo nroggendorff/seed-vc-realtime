@@ -71,11 +71,9 @@ class AstralQuantizer(torch.nn.Module):
             alt_inputs.input_values,
             attention_mask=alt_inputs.attention_mask,
         )
-        last_hidden_states = outputs.last_hidden_state
-        last_hidden_states = last_hidden_states[:, : feature_lens.max(), :]
+        last_hidden_states = outputs.last_hidden_state[:, : feature_lens.max(), :]
         feature_lens = feature_lens.clamp(max=last_hidden_states.size(1))
         last_hidden_states = last_hidden_states.transpose(1, 2)
-        x_hidden = self.encoder(last_hidden_states, feature_lens)
-        x_hidden = x_hidden.transpose(1, 2)
+        x_hidden = self.encoder(last_hidden_states, feature_lens).transpose(1, 2)
         x_quantized, indices = self.quantizer(x_hidden)[:2]
         return x_quantized, indices, feature_lens

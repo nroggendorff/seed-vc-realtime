@@ -47,14 +47,11 @@ class FCM(nn.Module):
 
     def forward(self, x):
         x = x.unsqueeze(1)
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = F.relu(self.bn2(self.conv2(out)))
+        out = self.layer1(F.relu(self.bn1(self.conv1(x))))
+        out = F.relu(self.bn2(self.conv2(self.layer2(out))))
 
         shape = out.shape
-        out = out.reshape(shape[0], shape[1] * shape[2], shape[3])
-        return out
+        return out.reshape(shape[0], shape[1] * shape[2], shape[3])
 
 
 class CAMPPlus(nn.Module):
@@ -146,8 +143,4 @@ class CAMPPlus(nn.Module):
 
     def forward(self, x, x_lens=None):
         x = x.permute(0, 2, 1)  # (B,T,F) => (B,F,T)
-        x = self.head(x)
-        x = self.xvector(x)
-        x = self.stats(x, x_lens)
-        x = self.dense(x)
-        return x
+        return self.dense(self.stats(self.xvector(self.head(x)), x_lens))

@@ -89,9 +89,7 @@ class Snake(nn.Module):
         alpha = self.alpha.unsqueeze(0).unsqueeze(-1)  # line up with x to [B, C, T]
         if self.alpha_logscale:
             alpha = torch.exp(alpha)
-        x = x + (1.0 / (alpha + self.no_div_by_zero)) * pow(sin(x * alpha), 2)
-
-        return x
+        return x + (1.0 / (alpha + self.no_div_by_zero)) * pow(sin(x * alpha), 2)
 
 
 def get_padding(kernel_size, dilation=1):
@@ -99,8 +97,7 @@ def get_padding(kernel_size, dilation=1):
 
 
 def init_weights(m, mean=0.0, std=0.01):
-    classname = m.__class__.__name__
-    if classname.find("Conv") != -1:
+    if m.__class__.__name__.find("Conv") != -1:
         m.weight.data.normal_(mean, std)
 
 
@@ -153,10 +150,8 @@ class ResBlock(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for idx in range(len(self.convs1)):
-            xt = self.activations1[idx](x)
-            xt = self.convs1[idx](xt)
-            xt = self.activations2[idx](xt)
-            xt = self.convs2[idx](xt)
+            xt = self.convs1[idx](self.activations1[idx](x))
+            xt = self.convs2[idx](self.activations2[idx](xt))
             x = xt + x
         return x
 
@@ -198,8 +193,7 @@ class SineGen(torch.nn.Module):
         self.voiced_threshold = voiced_threshold
 
     def _f02uv(self, f0):
-        uv = (f0 > self.voiced_threshold).type(torch.float32)
-        return uv
+        return (f0 > self.voiced_threshold).type(torch.float32)
 
     @torch.no_grad()
     def forward(self, f0):
@@ -231,8 +225,7 @@ class SineGen(torch.nn.Module):
         noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
         noise = noise_amp * torch.randn_like(sine_waves)
 
-        sine_waves = sine_waves * uv + noise
-        return sine_waves, uv, noise
+        return sine_waves * uv + noise, uv, noise
 
 
 class SourceModuleHnNSF(torch.nn.Module):
@@ -256,7 +249,6 @@ class SourceModuleHnNSF(torch.nn.Module):
     def __init__(
         self,
         sampling_rate,
-        upsample_scale,
         harmonic_num=0,
         sine_amp=0.1,
         add_noise_std=0.003,
@@ -290,8 +282,7 @@ class SourceModuleHnNSF(torch.nn.Module):
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
 
         # source for noise branch, in the same shape as uv
-        noise = torch.randn_like(uv) * self.sine_amp / 3
-        return sine_merge, noise, uv
+        return sine_merge, torch.randn_like(uv) * self.sine_amp / 3, uv
 
 
 class HiFTGenerator(nn.Module):
@@ -337,7 +328,6 @@ class HiFTGenerator(nn.Module):
         self.num_upsamples = len(upsample_rates)
         self.m_source = SourceModuleHnNSF(
             sampling_rate=sampling_rate,
-            upsample_scale=np.prod(upsample_rates) * istft_params["hop_len"],
             harmonic_num=nb_harmonics,
             sine_amp=nsf_alpha,
             add_noise_std=nsf_sigma,
@@ -365,8 +355,7 @@ class HiFTGenerator(nn.Module):
 
         self.source_downs = nn.ModuleList()
         self.source_resblocks = nn.ModuleList()
-        downsample_rates = [1] + upsample_rates[::-1][:-1]
-        downsample_cum_rates = np.cumprod(downsample_rates)
+        downsample_cum_rates = np.cumprod([1] + upsample_rates[::-1][:-1])
         for i, (u, k, d) in enumerate(
             zip(
                 downsample_cum_rates[::-1],
@@ -448,22 +437,17 @@ class HiFTGenerator(nn.Module):
     def forward(self, x: torch.Tensor, f0=None) -> torch.Tensor:
         if f0 is None:
             f0 = self.f0_predictor(x)
-        s = self._f02source(f0)
-
-        s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
+        s_stft_real, s_stft_imag = self._stft(self._f02source(f0).squeeze(1))
         s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
 
         x = self.conv_pre(x)
         for i in range(self.num_upsamples):
-            x = F.leaky_relu(x, self.lrelu_slope)
-            x = self.ups[i](x)
+            x = self.ups[i](F.leaky_relu(x, self.lrelu_slope))
 
             if i == self.num_upsamples - 1:
                 x = self.reflection_pad(x)
 
-            si = self.source_downs[i](s_stft)
-            si = self.source_resblocks[i](si)
-            x = x + si
+            x = x + self.source_resblocks[i](self.source_downs[i](s_stft))
 
             xs = None
             for j in range(self.num_kernels):
@@ -473,16 +457,14 @@ class HiFTGenerator(nn.Module):
                     xs += self.resblocks[i * self.num_kernels + j](x)
             x = xs / self.num_kernels
 
-        x = F.leaky_relu(x)
-        x = self.conv_post(x)
+        x = self.conv_post(F.leaky_relu(x))
         magnitude = torch.exp(x[:, : self.istft_params["n_fft"] // 2 + 1, :])
         phase = torch.sin(
             x[:, self.istft_params["n_fft"] // 2 + 1 :, :]
         )  # actually, sin is redundancy
 
         x = self._istft(magnitude, phase)
-        x = torch.clamp(x, -self.audio_limit, self.audio_limit)
-        return x
+        return torch.clamp(x, -self.audio_limit, self.audio_limit)
 
     def remove_weight_norm(self):
         print("Removing weight norm...")

@@ -6,10 +6,7 @@ import numpy as np
 def get_hparams_from_file(config_path):
     with open(config_path, "r", encoding="utf-8") as f:
         data = f.read()
-    config = json.loads(data)
-
-    hparams = HParams(**config)
-    return hparams
+    return HParams(**json.loads(data))
 
 
 class HParams:
@@ -49,9 +46,7 @@ def string_to_bits(string, pad_len=8):
 
     binary_values = [bin(value)[2:].zfill(8) for value in ascii_values]
 
-    bit_arrays = [[int(bit) for bit in binary] for binary in binary_values]
-
-    numpy_array = np.array(bit_arrays)
+    numpy_array = np.array([[int(bit) for bit in binary] for binary in binary_values])
     numpy_array_full = np.zeros((pad_len, 8), dtype=numpy_array.dtype)
     numpy_array_full[:, 2] = 1
     max_len = min(pad_len, len(numpy_array))
@@ -64,9 +59,7 @@ def bits_to_string(bits_array):
 
     ascii_values = [int(binary, 2) for binary in binary_values]
 
-    output_string = "".join(chr(value) for value in ascii_values)
-
-    return output_string
+    return "".join(chr(value) for value in ascii_values)
 
 
 def split_sentence(text, min_len=10, language_str="[EN]"):
@@ -87,12 +80,9 @@ def split_sentences_latin(text, min_len=10):
         List[str]: list of output sentences.
     """
     # deal with dirty sentences
-    text = re.sub("[。！？；]", ".", text)
-    text = re.sub("[，]", ",", text)
-    text = re.sub("[“”]", '"', text)
-    text = re.sub("[‘’]", "'", text)
-    text = re.sub(r"[\<\>\(\)\[\]\"\«\»]+", "", text)
-    text = re.sub("[\n\t ]+", " ", text)
+    text = re.sub("[，]", ",", re.sub("[。！？；]", ".", text))
+    text = re.sub("[‘’]", "'", re.sub("[“”]", '"', text))
+    text = re.sub("[\n\t ]+", " ", re.sub(r"[\<\>\(\)\[\]\"\«\»]+", "", text))
     text = re.sub("([,.!?;])", r"\1 $#!", text)
     sentences = [s.strip() for s in text.split("$#!")]
     if len(sentences[-1]) == 0:
@@ -138,10 +128,8 @@ def merge_short_sentences_latin(sens):
 
 
 def split_sentences_zh(text, min_len=10):
-    text = re.sub("[。！？；]", ".", text)
-    text = re.sub("[，]", ",", text)
-    text = re.sub("[\n\t ]+", " ", text)
-    text = re.sub("([,.!?;])", r"\1 $#!", text)
+    text = re.sub("[，]", ",", re.sub("[。！？；]", ".", text))
+    text = re.sub("([,.!?;])", r"\1 $#!", re.sub("[\n\t ]+", " ", text))
     sentences = [s.strip() for s in text.split("$#!")]
     if len(sentences[-1]) == 0:
         del sentences[-1]

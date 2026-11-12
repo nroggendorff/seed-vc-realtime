@@ -20,8 +20,7 @@ def find_multiple(n: int, k: int) -> int:
 
 
 def l2norm(t, groups=1):
-    t = rearrange(t, "... (g d) -> ... g d", g=groups)
-    t = F.normalize(t, p=2, dim=-1)
+    t = F.normalize(rearrange(t, "... (g d) -> ... g d", g=groups), p=2, dim=-1)
     return rearrange(t, "... g d -> ... (g d)")
 
 
@@ -54,9 +53,7 @@ class BaseModelArgs:
         if self.n_local_heads == -1:
             self.n_local_heads = self.n_head
         if self.intermediate_size is None:
-            hidden_dim = 4 * self.dim
-            n_hidden = int(2 * hidden_dim / 3)
-            self.intermediate_size = find_multiple(n_hidden, 256)
+            self.intermediate_size = find_multiple(int(2 * (4 * self.dim) / 3), 256)
         self.head_dim = self.dim // self.n_head
 
     def save(self, path: str):
@@ -189,8 +186,7 @@ class BaseTransformer(nn.Module):
         for bib in range(x.size(0)):
             x[bib, x_lens[bib] :] = self.config.vocab_size - 1
 
-        x_emb = self.embeddings(x)
-        return x, x_emb
+        return x, self.embeddings(x)
 
     def forward(
         self,
@@ -238,7 +234,6 @@ class BaseTransformer(nn.Module):
         inp: Tensor,
         input_pos: Optional[Tensor] = None,
         kv_pos: Optional[Tensor] = None,
-        return_all: bool = False,
     ) -> BaseTransformerForwardResult:
         # This is used for generation, optimized for torch compile
 
@@ -253,9 +248,7 @@ class BaseTransformer(nn.Module):
 
         x = x[:, -1:]
 
-        slow_out = self.norm(x)
-
-        token_logits = self.output(slow_out)
+        token_logits = self.output(self.norm(x))
 
         return BaseTransformerForwardResult(
             logits=token_logits,
@@ -318,20 +311,9 @@ class NaiveTransformer(BaseTransformer):
 
     def infer_slow(self, inp: Tensor, input_pos: Optional[Tensor] = None):
         # no kv cache used
-        parent_result = super().forward(inp, input_pos=input_pos)
-        base_logits = parent_result.logits[:, -1]
+        base_logits = super().forward(inp, input_pos=input_pos).logits[:, -1]
         base_sampled, _ = topk_sampling(base_logits, top_k=-1, top_p=1.0)
         return base_sampled
-
-    def forward_generate(
-        self,
-        x: Tensor,
-        input_pos: Optional[Tensor] = None,
-        kv_pos: Optional[Tensor] = None,
-        vq_masks: Optional[Tensor] = None,
-    ) -> TransformerForwardResult:
-        x = super().forward_generate(x, input_pos, kv_pos, vq_masks)
-        return x
 
 
 class NaiveWrapper(nn.Module):
@@ -500,8 +482,7 @@ class NaiveWrapper(nn.Module):
                 **sampling_kwargs_main,
             )[0]
         ]
-        codebooks = torch.stack(codebooks, dim=0)
-        return codebooks
+        return torch.stack(codebooks, dim=0)
 
 
 class TransformerBlock(nn.Module):
@@ -516,8 +497,7 @@ class TransformerBlock(nn.Module):
         self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Tensor = None
     ) -> Tensor:
         h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
-        out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+        return h + self.feed_forward(self.ffn_norm(h))
 
 
 class Attention(nn.Module):
@@ -554,7 +534,7 @@ class Attention(nn.Module):
                 torch.ones(self.n_head, 1, self.head_dim)
             )
 
-    def load_hook(self, state_dict, prefix, *args):
+    def load_hook(self, state_dict, prefix, *_args):
         if prefix + "wq.weight" in state_dict:
             wq = state_dict.pop(prefix + "wq.weight")
             wk = state_dict.pop(prefix + "wk.weight")
@@ -578,8 +558,7 @@ class Attention(nn.Module):
         v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
         if self.qk_norm:
-            qk_l2norm = partial(l2norm, groups=self.qk_norm_groups)
-            q, k = map(qk_l2norm, (q, k))
+            q, k = map(partial(l2norm, groups=self.qk_norm_groups), (q, k))
 
             q = q * self.qk_norm_q_scale
             k = k * self.qk_norm_k_scale
@@ -622,9 +601,7 @@ class Attention(nn.Module):
                 dropout_p=self.dropout if self.training else 0.0,
             )
 
-        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
-
-        return self.wo(y)
+        return self.wo(y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim))
 
     def eq_scaled_dot_product_attention(
         self,
@@ -650,9 +627,7 @@ class Attention(nn.Module):
         attn_weight = query @ key.transpose(-2, -1) * scale_factor
         attn_weight += attn_bias
         attn_weight = torch.softmax(attn_weight, dim=-1)
-        attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
-
-        return attn_weight @ value
+        return torch.dropout(attn_weight, dropout_p, train=True) @ value
 
 
 class FeedForward(nn.Module):
@@ -677,16 +652,14 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x: Tensor) -> Tensor:
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        return self._norm(x.float()).type_as(x) * self.weight
 
 
 def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000) -> Tensor:
     freqs = 1.0 / (
         base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem)
     )
-    t = torch.arange(seq_len, device=freqs.device)
-    freqs = torch.outer(t, freqs)
+    freqs = torch.outer(torch.arange(seq_len, device=freqs.device), freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
     return cache.to(dtype=torch.bfloat16)
@@ -703,8 +676,7 @@ def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
         -1,
     )
 
-    x_out2 = x_out2.flatten(3)
-    return x_out2.type_as(x)
+    return x_out2.flatten(3).type_as(x)
 
 
 def top_k_top_p_filtering(
@@ -759,8 +731,7 @@ def topk_sampling(logits, top_k=10, top_p=1.0, temperature=1.0):
     logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
     token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
     logprobs = F.log_softmax(logits.float(), dim=-1)
-    current_logprobs = logprobs[torch.arange(logprobs.shape[0]), token.squeeze(1)]
-    return token, current_logprobs
+    return token, logprobs[torch.arange(logprobs.shape[0]), token.squeeze(1)]
 
 
 def sample(
@@ -771,8 +742,7 @@ def sample(
     probs = logits_to_probs(
         logits=logits[0, -1], previous_tokens=previous_tokens, **sampling_kwargs
     )
-    idx_next = multinomial_sample_one_no_sync(probs)
-    return idx_next, probs
+    return multinomial_sample_one_no_sync(probs), probs
 
 
 def multinomial_sample_one_no_sync(
@@ -810,7 +780,4 @@ def logits_to_probs(
     )
     logits = logits.masked_fill(indices_to_remove, -float("Inf"))
 
-    logits = logits / max(temperature, 1e-5)
-
-    probs = torch.nn.functional.softmax(logits, dim=-1)
-    return probs
+    return torch.nn.functional.softmax(logits / max(temperature, 1e-5), dim=-1)

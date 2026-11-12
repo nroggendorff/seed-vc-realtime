@@ -32,8 +32,7 @@ class ConvLayerNorm(nn.LayerNorm):
 
     def forward(self, x):
         x = einops.rearrange(x, "b ... t -> b t ...")
-        x = super().forward(x)
-        x = einops.rearrange(x, "b t ... -> b ... t")
+        x = einops.rearrange(super().forward(x), "b t ... -> b ... t")
         return
 
 
@@ -86,8 +85,7 @@ def get_extra_padding_for_conv1d(
     """See `pad_for_conv1d`."""
     length = x.shape[-1]
     n_frames = (length - kernel_size + padding_total) / stride + 1
-    ideal_length = (math.ceil(n_frames) - 1) * stride + (kernel_size - padding_total)
-    return ideal_length - length
+    return (math.ceil(n_frames) - 1) * stride + (kernel_size - padding_total) - length
 
 
 def pad_for_conv1d(
@@ -126,8 +124,7 @@ def pad1d(
             extra_pad = max_pad - length + 1
             x = F.pad(x, (0, extra_pad))
         padded = F.pad(x, paddings, mode, value)
-        end = padded.shape[-1] - extra_pad
-        return padded[..., :end]
+        return padded[..., : (padded.shape[-1] - extra_pad)]
     else:
         return F.pad(x, paddings, mode, value)
 
@@ -137,8 +134,7 @@ def unpad1d(x: torch.Tensor, paddings: tp.Tuple[int, int]):
     padding_left, padding_right = paddings
     assert padding_left >= 0 and padding_right >= 0, (padding_left, padding_right)
     assert (padding_left + padding_right) <= x.shape[-1]
-    end = x.shape[-1] - padding_right
-    return x[..., padding_left:end]
+    return x[..., padding_left : (x.shape[-1] - padding_right)]
 
 
 class NormConv1d(nn.Module):
@@ -160,9 +156,7 @@ class NormConv1d(nn.Module):
         self.norm_type = norm
 
     def forward(self, x):
-        x = self.conv(x)
-        x = self.norm(x)
-        return x
+        return self.norm(self.conv(x))
 
 
 class NormConv2d(nn.Module):
@@ -183,9 +177,7 @@ class NormConv2d(nn.Module):
         self.norm_type = norm
 
     def forward(self, x):
-        x = self.conv(x)
-        x = self.norm(x)
-        return x
+        return self.norm(self.conv(x))
 
 
 class NormConvTranspose1d(nn.Module):
@@ -209,9 +201,7 @@ class NormConvTranspose1d(nn.Module):
         self.norm_type = norm
 
     def forward(self, x):
-        x = self.convtr(x)
-        x = self.norm(x)
-        return x
+        return self.norm(self.convtr(x))
 
 
 class NormConvTranspose2d(nn.Module):
@@ -233,9 +223,7 @@ class NormConvTranspose2d(nn.Module):
         self.norm = get_norm_module(self.convtr, causal=False, norm=norm, **norm_kwargs)
 
     def forward(self, x):
-        x = self.convtr(x)
-        x = self.norm(x)
-        return x
+        return self.norm(self.convtr(x))
 
 
 class SConv1d(nn.Module):
@@ -256,7 +244,6 @@ class SConv1d(nn.Module):
         norm: str = "none",
         norm_kwargs: tp.Dict[str, tp.Any] = {},
         pad_mode: str = "reflect",
-        **kwargs,
     ):
         super().__init__()
         if stride > 1 and dilation > 1:
@@ -319,7 +306,6 @@ class SConvTranspose1d(nn.Module):
         norm: str = "none",
         trim_right_ratio: float = 1.0,
         norm_kwargs: tp.Dict[str, tp.Any] = {},
-        **kwargs,
     ):
         super().__init__()
         self.convtr = NormConvTranspose1d(
@@ -339,9 +325,7 @@ class SConvTranspose1d(nn.Module):
         assert self.trim_right_ratio >= 0.0 and self.trim_right_ratio <= 1.0
 
     def forward(self, x):
-        kernel_size = self.convtr.convtr.kernel_size[0]
-        stride = self.convtr.convtr.stride[0]
-        padding_total = kernel_size - stride
+        padding_total = self.convtr.convtr.kernel_size[0] - self.convtr.convtr.stride[0]
 
         y = self.convtr(x)
 
@@ -383,5 +367,4 @@ class SLSTM(nn.Module):
             y, self.hidden = self.lstm(x, self.hidden)
         if self.skip:
             y = y + x
-        y = y.permute(1, 2, 0)
-        return y
+        return y.permute(1, 2, 0)

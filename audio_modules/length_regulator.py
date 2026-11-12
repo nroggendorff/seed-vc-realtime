@@ -19,14 +19,12 @@ f0_mel_max = 1127 * np.log(1 + f0_max / 700)
 def f0_to_coarse(f0, f0_bin):
     f0_mel = 1127 * (1 + f0 / 700).log()
     a = (f0_bin - 2) / (f0_mel_max - f0_mel_min)
-    b = f0_mel_min * a - 1.0
-    f0_mel = torch.where(f0_mel > 0, f0_mel * a - b, f0_mel)
+    f0_mel = torch.where(f0_mel > 0, f0_mel * a - (f0_mel_min * a - 1.0), f0_mel)
     f0_coarse = torch.round(f0_mel).long()
     f0_coarse = f0_coarse * (f0_coarse > 0)
     f0_coarse = f0_coarse + ((f0_coarse < 1) * 1)
     f0_coarse = f0_coarse * (f0_coarse < f0_bin)
-    f0_coarse = f0_coarse + ((f0_coarse >= f0_bin) * (f0_bin - 1))
-    return f0_coarse
+    return f0_coarse + ((f0_coarse >= f0_bin) * (f0_bin - 1))
 
 
 class InterpolateRegulator(nn.Module):
@@ -53,9 +51,7 @@ class InterpolateRegulator(nn.Module):
             self.interpolate = True
             for _ in sampling_ratios:
                 module = nn.Conv1d(channels, channels, 3, 1, 1)
-                norm = nn.GroupNorm(groups, channels)
-                act = nn.Mish()
-                model.extend([module, norm, act])
+                model.extend([module, nn.GroupNorm(groups, channels), nn.Mish()])
         else:
             self.interpolate = False
         model.append(nn.Conv1d(channels, out_channels, 1, 1))
@@ -154,5 +150,4 @@ class InterpolateRegulator(nn.Module):
             ) = self.vq(out.transpose(1, 2))
             out_q = out_q.transpose(1, 2)
             return out_q * mask, ylens, codes, commitment_loss, codebook_loss
-        olens = ylens
-        return out * mask, olens, None, None, None
+        return out * mask, ylens, None, None, None
