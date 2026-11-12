@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
-import time
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -110,7 +109,6 @@ class Transformer(nn.Module):
             context_freqs_cis = self.freqs_cis[context_input_pos]
         else:
             context_freqs_cis = None
-        skip_in_x_list = []
         for i, layer in enumerate(self.layers):
             x = layer(
                 x, c, freqs_cis, mask, context, context_freqs_cis, cross_attention_mask

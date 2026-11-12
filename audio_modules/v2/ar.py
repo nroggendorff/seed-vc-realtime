@@ -1,10 +1,7 @@
-import dataclasses
 import json
 import math
-from collections import OrderedDict
-from functools import partial, wraps
+from functools import partial
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Tuple, List
 from tqdm import tqdm
 
@@ -322,7 +319,6 @@ class NaiveTransformer(BaseTransformer):
     def infer_slow(self, inp: Tensor, input_pos: Optional[Tensor] = None):
         # no kv cache used
         parent_result = super().forward(inp, input_pos=input_pos)
-        latent = parent_result.hidden_states[:, -1]
         base_logits = parent_result.logits[:, -1]
         base_sampled, _ = topk_sampling(base_logits, top_k=-1, top_p=1.0)
         return base_sampled
@@ -584,7 +580,6 @@ class Attention(nn.Module):
         if self.qk_norm:
             qk_l2norm = partial(l2norm, groups=self.qk_norm_groups)
             q, k = map(qk_l2norm, (q, k))
-            scale = self.qk_norm_scale
 
             q = q * self.qk_norm_q_scale
             k = k * self.qk_norm_k_scale

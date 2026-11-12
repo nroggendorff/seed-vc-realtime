@@ -2,7 +2,6 @@ import os
 import torch
 import argparse
 import gradio as gr
-from zipfile import ZipFile
 import langid
 from . import se_extractor
 from .api import BaseSpeakerTTS, ToneColorConverter

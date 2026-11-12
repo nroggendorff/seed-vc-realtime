@@ -5,12 +5,10 @@ import threading
 import traceback
 import warnings
 import yaml
-import re
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio
-import torchaudio.compliance.kaldi as kaldi
 import torchaudio.transforms as tat
 import sounddevice as sd
 import librosa
@@ -168,7 +166,6 @@ class RealtimeVCEngine:
         model_params = recursive_munch(config["model_params"])
         model_params.dit_type = "DiT"
         model = build_model(model_params, stage="DiT")
-        hop_length = config["preprocess_params"]["spect_params"]["hop_length"]
         sr = config["preprocess_params"]["sr"]
 
         model, _, _, _ = load_checkpoint(
@@ -444,9 +441,12 @@ class RealtimeVCEngine:
         return min(max_input_channels, max_output_channels, 2)
 
     def set_config(self, **kwargs):
+        # Reject unknown keys up front rather than skipping them: a misspelt key would otherwise leave that setting at its default with no sign anything went wrong (the GUI's WASAPI-exclusive checkbox was lost that way). Checked before any assignment so a bad call changes nothing.
+        unknown = [k for k in kwargs if not hasattr(self.config, k)]
+        if unknown:
+            raise TypeError(f"set_config() got unknown keys: {', '.join(unknown)}")
         for k, v in kwargs.items():
-            if hasattr(self.config, k):
-                setattr(self.config, k, v)
+            setattr(self.config, k, v)
 
         if "sr_type" in kwargs:
             self.config.sr_model = self.config.sr_type == "sr_model"

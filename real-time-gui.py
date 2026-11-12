@@ -9,7 +9,6 @@ import argparse
 import numpy as np
 import torch
 import FreeSimpleGUI as sg
-from multiprocessing import cpu_count
 from multiprocessing import shared_memory
 from dotenv import load_dotenv
 from realtime_vc_engine import RealtimeVCEngine
@@ -459,7 +458,7 @@ class GUI:
 
         self.engine.set_config(
             sg_hostapi=values["sg_hostapi"],
-            sg_wasapi_exclusive=values["sg_wasapi_exclusive"],
+            wasapi_exclusive=values["sg_wasapi_exclusive"],
             sg_input_device=values["sg_input_device"],
             sg_output_device=values["sg_output_device"],
             reference_audio_path=values["reference_audio_path"],

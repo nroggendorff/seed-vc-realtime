@@ -15,8 +15,6 @@ from torch.nn.utils import weight_norm
 from dataclasses import dataclass
 from typing import Optional
 
-import torch
-import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 
@@ -97,7 +95,6 @@ class Transformer(nn.Module):
             and self.max_batch_size >= max_batch_size
         ):
             return
-        head_dim = self.config.dim // self.config.n_head
         max_seq_length = find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
