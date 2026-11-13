@@ -152,6 +152,10 @@ class RealtimeVCEngine:
 
     def _load_models(self, args):
         print(f"Using fp16: {self.fp16}")
+        if self.device.type == "cuda":
+            # Plain matmul attention for every SDPA call. PyTorch's fused memory-efficient kernel intermittently hits an illegal memory access in fp16 (torch 2.11; Windows builds have no flash attention, so SDPA falls back to it). The speech tokenizers always run fp16, and so does the DiT under --fp16. cuDNN attention is untested here, so it is off too.
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            torch.backends.cuda.enable_cudnn_sdp(False)
         if args.checkpoint_path is None or args.checkpoint_path == "":
             dit_checkpoint_path, dit_config_path = load_custom_model_from_hf(
                 "Plachta/Seed-VC",

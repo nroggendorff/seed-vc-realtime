@@ -24,6 +24,7 @@ MIN_LR_RATIO = 0.1  # cosine decay ends at LEARNING_RATE * MIN_LR_RATIO
 SAVE_EVERY = 100
 MIN_SECONDS = 1.0  # shorter clips are skipped
 MAX_SECONDS = 30.0  # longer files are split into equal pieces no longer than this
+MAX_VRAM_GB = 10.0
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg", ".m4a", ".opus")
@@ -58,6 +59,11 @@ def load_clips(sr):
 
 def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    if DEVICE == "cuda":
+        total = torch.cuda.get_device_properties(0).total_memory
+        torch.cuda.set_per_process_memory_fraction(
+            min(1.0, MAX_VRAM_GB * 1024**3 / total)
+        )
 
     from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2Model
     from audio_modules.audio import mel_spectrogram
@@ -143,7 +149,10 @@ def main():
     )
 
     extractor = Wav2Vec2FeatureExtractor.from_pretrained(params.speech_tokenizer.name)
-    wav2vec = Wav2Vec2Model.from_pretrained(params.speech_tokenizer.name)
+    # Eager attention: SDPA's fp16 memory-efficient kernel intermittently hits an illegal memory access here (torch 2.11, Windows), and eager is just as fast at these lengths.
+    wav2vec = Wav2Vec2Model.from_pretrained(
+        params.speech_tokenizer.name, attn_implementation="eager"
+    )
     wav2vec.encoder.layers = wav2vec.encoder.layers[
         : params.speech_tokenizer.output_layer
     ]
