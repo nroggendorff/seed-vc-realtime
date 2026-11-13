@@ -1,3 +1,4 @@
+import math
 import os
 import random
 import shutil
@@ -15,8 +16,11 @@ RUN_NAME = "my_voice"  # output goes to ./runs/<RUN_NAME>/
 CONFIG_PATH = "./configs/presets/config_dit_mel_seed_uvit_xlsr_tiny.yml"
 PRETRAINED_CKPT = None  # None = the GUI's default model; or a previous ft_model.pth from which to continue
 MAX_STEPS = 1000
-BATCH_SIZE = 2
+EFFECTIVE_BATCH_SIZE = 32
+BATCH_SIZE = 5
 LEARNING_RATE = 1e-5
+WARMUP_STEPS = 50
+MIN_LR_RATIO = 0.1  # cosine decay ends at LEARNING_RATE * MIN_LR_RATIO
 SAVE_EVERY = 100
 MIN_SECONDS = 1.0  # shorter clips are skipped
 MAX_SECONDS = 30.0  # longer files are split into equal pieces no longer than this
@@ -110,6 +114,15 @@ def main():
         weight_decay=0.01,
     )
 
+    def lr_factor(step):
+        if step < WARMUP_STEPS:
+            return (step + 1) / WARMUP_STEPS
+        progress = min(1.0, (step - WARMUP_STEPS) / max(1, MAX_STEPS - WARMUP_STEPS))
+        cosine = 0.5 * (1 + math.cos(math.pi * progress))
+        return MIN_LR_RATIO + (1 - MIN_LR_RATIO) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+
     campplus = CAMPPlus(feat_dim=80, embedding_size=192)
     campplus.load_state_dict(
         torch.load(
@@ -150,10 +163,8 @@ def main():
     def save():
         torch.save({"net": {key: model[key].state_dict() for key in model}}, out_path)
 
-    smooth_loss = None
-    bar = tqdm(range(1, MAX_STEPS + 1))
-    for step in bar:
-        waves = [c.to(DEVICE) for c in random.choices(clips, k=BATCH_SIZE)]
+    def compute_loss(n):
+        waves = [c.to(DEVICE) for c in random.choices(clips, k=n)]
         mels = [mel_spectrogram(w[None], **mel_args)[0] for w in waves]
         wave_lengths = torch.tensor([len(w) for w in waves], device=DEVICE)
         mel_lengths = torch.tensor([m.size(1) for m in mels], device=DEVICE)
@@ -166,7 +177,7 @@ def main():
             waves_22k = torchaudio.functional.resample(waves, sr, 22050)
             lengths_22k = (wave_lengths.float() * 22050 / sr).long()
             src_se = converter.extract_se(waves_22k, lengths_22k)
-            tgt_se = se_db[torch.randint(0, len(se_db), (BATCH_SIZE,))].to(DEVICE)
+            tgt_se = se_db[torch.randint(0, len(se_db), (n,))].to(DEVICE)
             converted_22k = converter.convert(
                 waves_22k, lengths_22k, src_se, tgt_se
             ).squeeze(1)
@@ -189,28 +200,40 @@ def main():
         ori_cond = model.length_regulator(S_ori, ylens=mel_lengths)[0]
         alt_cond = model.length_regulator(S_alt, ylens=mel_lengths)[0]
 
-        prompt_len = (
-            (torch.rand(BATCH_SIZE, device=DEVICE) * (mel_lengths - 1)).floor().long()
-        )
-        prompt_len[torch.rand(BATCH_SIZE, device=DEVICE) < 0.1] = 0
+        prompt_len = (torch.rand(n, device=DEVICE) * (mel_lengths - 1)).floor().long()
+        prompt_len[torch.rand(n, device=DEVICE) < 0.1] = 0
         cond = alt_cond.clone()
-        for i in range(BATCH_SIZE):
+        for i in range(n):
             cond[i, : prompt_len[i]] = ori_cond[i, : prompt_len[i]]
 
         loss, _ = model.cfm(mels, mel_lengths, prompt_len, cond, style)
+        return loss
 
+    # Full forward passes of BATCH_SIZE plus one smaller pass for any remainder. The loss is a per-clip mean, so weighting each pass by its share of the clips gives the same gradient as a single EFFECTIVE_BATCH_SIZE batch.
+    micro_batches = [BATCH_SIZE] * (EFFECTIVE_BATCH_SIZE // BATCH_SIZE)
+    if EFFECTIVE_BATCH_SIZE % BATCH_SIZE:
+        micro_batches.append(EFFECTIVE_BATCH_SIZE % BATCH_SIZE)
+
+    smooth_loss = None
+    bar = tqdm(range(1, MAX_STEPS + 1))
+    for step in bar:
         optimizer.zero_grad()
-        loss.backward()
+        step_loss = 0.0
+        for n in micro_batches:
+            loss = compute_loss(n)
+            (loss * n / EFFECTIVE_BATCH_SIZE).backward()
+            step_loss += loss.item() * n / EFFECTIVE_BATCH_SIZE
         torch.nn.utils.clip_grad_norm_(model.cfm.parameters(), 10.0)
         torch.nn.utils.clip_grad_norm_(model.length_regulator.parameters(), 10.0)
         optimizer.step()
+        scheduler.step()
 
         smooth_loss = (
-            loss.item()
-            if smooth_loss is None
-            else 0.99 * smooth_loss + 0.01 * loss.item()
+            step_loss if smooth_loss is None else 0.99 * smooth_loss + 0.01 * step_loss
         )
-        bar.set_postfix(loss=f"{smooth_loss:.4f}")
+        bar.set_postfix(
+            loss=f"{smooth_loss:.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}"
+        )
         if step % SAVE_EVERY == 0 or step == MAX_STEPS:
             save()
 
