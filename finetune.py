@@ -190,9 +190,9 @@ def main():
             )
 
             style = []
-            for w, n in zip(waves_16k, lengths_16k):
+            for w, length in zip(waves_16k, lengths_16k):
                 feat = kaldi.fbank(
-                    w[None, :n], num_mel_bins=80, dither=0, sample_frequency=16000
+                    w[None, :length], num_mel_bins=80, dither=0, sample_frequency=16000
                 )
                 style.append(campplus((feat - feat.mean(dim=0, keepdim=True))[None]))
             style = torch.cat(style)
