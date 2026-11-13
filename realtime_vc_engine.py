@@ -68,6 +68,8 @@ class RealtimeVCConfig:
         self.O_noise_reduce = False
         self.inference_cfg_rate = 0.7
         self.max_prompt_length = 3.0
+        # Prompt each chunk with the mel the previous chunk generated for the DiT's left context, so the DiT continues the pitch and timbre it just played instead of picking them afresh every block.
+        self.chunk_continuity = True
         self.sg_hostapi = ""
         self.wasapi_exclusive = False
         self.sg_input_device = ""
@@ -112,6 +114,7 @@ class RealtimeVCEngine:
         self.prompt_condition = None
         self.mel2 = None
         self.style2 = None
+        self.prev_mel = None  # last chunk's DiT-region mel, for chunk_continuity
         self.reference_wav_name = ""
         self.prompt_len = 3
         self.ce_dit_difference = 2.0
@@ -568,6 +571,7 @@ class RealtimeVCEngine:
         else:
             self.resampler2 = None
 
+        self.prev_mel = None
         self.vad_cache = {}
         # Keep the VAD chunk within what FSMN-VAD can handle, independent of block_time: the slider goes down to 0.04s, which is below the model's minimum. _audio_callback accumulates audio to fill exactly this much.
         self.vad_chunk_size = min(
@@ -746,6 +750,7 @@ class RealtimeVCEngine:
                 S_ori, ylens=target2_lengths, n_quantizers=3, f0=None
             )[0]
             self.reference_wav_name = self.config.reference_audio_path
+            self.prev_mel = None
 
         S_alt = semantic_fn(input_wav_res.unsqueeze(0))
 
@@ -770,6 +775,25 @@ class RealtimeVCEngine:
         )[0]
         cat_condition = torch.cat([self.prompt_condition, cond], dim=1)
 
+        # The DiT's left context (extra_time) is audio the previous chunk already generated and played: this chunk's window is the previous one moved on by one block. Feeding that mel in as a prompt continuation makes the DiT continue it, as in training, where the prompt is the start of the same utterance. Without it, each chunk re-decides pitch from noise, which audibly jumps at chunk boundaries.
+        prompt_mel = self.mel2
+        left = 0
+        if self.config.chunk_continuity and self.prev_mel is not None:
+            shift = int(
+                round(self.block_frame / self.config.samplerate * sr / hop_length)
+            )
+            left = min(
+                int(self.active_extra_time * sr // hop_length),
+                self.prev_mel.size(2) - shift,
+                cond.size(1) - 1,
+            )
+            if left > 0:
+                prompt_mel = torch.cat(
+                    [self.mel2, self.prev_mel[:, :, shift : shift + left]], dim=2
+                )
+            else:
+                left = 0
+
         with torch.autocast(
             device_type=self.device.type,
             dtype=torch.float16 if self.fp16 else torch.float32,
@@ -777,12 +801,18 @@ class RealtimeVCEngine:
             vc_target = model.cfm.inference(
                 cat_condition,
                 torch.LongTensor([cat_condition.size(1)]).to(self.mel2.device),
-                self.mel2,
+                prompt_mel,
                 self.style2,
                 n_timesteps=int(self.config.diffusion_steps),
                 inference_cfg_rate=self.config.inference_cfg_rate,
             )
             vc_target = vc_target[:, :, self.mel2.size(-1) :]
+            if left:
+                # The solver zeroes the prompt span; put the continued frames back so the vocoder sees real context there.
+                vc_target = torch.cat(
+                    [prompt_mel[:, :, -left:], vc_target[:, :, left:]], dim=2
+                )
+            self.prev_mel = vc_target.float()
             vc_wave = vocoder_fn(vc_target).squeeze()
 
         output_len = self.return_length * sr // 50
