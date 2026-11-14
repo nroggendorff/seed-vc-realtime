@@ -26,24 +26,26 @@ SAVE_EVERY = 100
 MIN_SECONDS = 1.0  # shorter clips are skipped
 MAX_SECONDS = 30.0  # longer files are split into equal pieces no longer than this
 MAX_VRAM_GB = 10.0
-# Pitch conditioning: feed the model each clip's F0 (RMVPE) alongside the content, so at conversion time the input's pitch drives the output's instead of the model inferring it from content features that carry almost none. Turns on f0_condition in the run's config. The F0 embedding starts at zero, so training starts from the base model's behaviour, and it gets its own, higher learning rate: at LEARNING_RATE it would barely move from zero in a finetune this short.
+# Condition on each clip's RMVPE F0 so the input's pitch drives the output; content features
+# carry almost none. The F0 embedding starts at zero and needs a higher LR to move in time.
 F0_CONDITION = True
 F0_LEARNING_RATE = 1e-3
 F0_THRESHOLD = 0.03  # RMVPE voicing threshold; keep it equal to the engine's
-# Optional, off by default: for this share of clips the prompt part (the start of the same clip, which otherwise gives away the target's pitch register) is pitch-shifted by a random whole number of semitones up to F0_SHIFT_MAX, with its F0 shifted to match, while the part being learned stays as recorded, so the F0 is the only reliable cue to the target's pitch. The shift keeps the spectral envelope (formants), so the prompt still sounds like the same speaker. Measured with 0.7 over 1000 steps on 13 min of one voice: offline (whole utterances) the output followed 3.3 of 6 requested semitones instead of 2.1-2.4, but in the real-time engine it followed no better (+1.7 of +4 either way) and its seams were worse (90th-percentile seam step 134 vs 120 cents).
+# Share of clips whose prompt is pitch-shifted (formants kept) by up to F0_SHIFT_MAX semitones,
+# so F0 is the only reliable pitch cue. Off: it didn't help the real-time engine and hurt seams.
 F0_SHIFT_SHARE = 0.0
 F0_SHIFT_MAX = 4
-F0_SHIFT_ENVELOPE = 20  # cepstral coefficients over mel bins kept as the envelope; more starts eating the harmonics of high voices
+F0_SHIFT_ENVELOPE = 20  # cepstral coefficients in the envelope; more eats harmonics
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg", ".m4a", ".opus")
 
 
 def pitch_shift(wave, k, n_fft=1024):
-    """Pitch-shift a 1-D wave by about k semitones, keeping its length; returns (wave, exact pitch factor).
-    Phase-vocoder time stretch, then resampling back to the original duration. The factor is rounded to
-    a fraction with a small denominator (63/50 for +4: 0.1 cent off), which keeps the resampling
-    kernel tiny; torchaudio's PitchShift resamples by e.g. 27781/22050, whose kernel takes gigabytes.
+    """Pitch-shift by about k semitones, keeping the length; returns (wave, exact factor).
+
+    The factor is a small-denominator fraction (63/50 for +4) so the resampling kernel stays
+    small; torchaudio's PitchShift resamples by e.g. 27781/22050, which takes gigabytes.
     """
     factor = Fraction(2 ** (k / 12)).limit_denominator(64)
     hop = n_fft // 4
@@ -149,7 +151,7 @@ def main():
             is_half=False,
             device=DEVICE,
         )
-        # Once per clip up front: clips are reused every step and RMVPE is the slow part. 100 frames/s, 0 where unvoiced.
+        # Precomputed, since RMVPE is slow. 100 frames/s, 0 where unvoiced.
         clip_f0 = [
             torch.from_numpy(
                 rmvpe.infer_from_audio(
@@ -212,7 +214,7 @@ def main():
     )
     campplus.eval().to(DEVICE)
 
-    # OpenVoice re-voices each clip as a random other speaker before content features are taken, so the model has to get the target timbre from the prompt/style.
+    # Content comes from a re-voiced copy, so timbre must come from the prompt and style.
     ov_ckpt, ov_config = load_custom_model_from_hf(
         "myshell-ai/OpenVoiceV2", "converter/checkpoint.pth", "converter/config.json"
     )
@@ -223,7 +225,7 @@ def main():
     )
 
     extractor = Wav2Vec2FeatureExtractor.from_pretrained(params.speech_tokenizer.name)
-    # Eager attention: SDPA's fp16 memory-efficient kernel intermittently hits an illegal memory access here (torch 2.11, Windows), and eager is just as fast at these lengths.
+    # Eager: fp16 mem-efficient SDPA intermittently hits an illegal memory access (torch 2.11).
     wav2vec = Wav2Vec2Model.from_pretrained(
         params.speech_tokenizer.name, attn_implementation="eager"
     )
@@ -263,7 +265,7 @@ def main():
 
     @torch.no_grad()
     def shift_prompt(wave, mel, k):
-        """wave pitch-shifted by about k semitones, its log-mel carrying the unshifted mel's envelope, and the exact F0 factor."""
+        """Shifted wave, its log-mel with the original envelope, and the exact F0 factor."""
         shifted, factor = pitch_shift(wave, k)
         shifted_mel = mel_spectrogram(shifted[None], **mel_args)[0][:, : mel.size(1)]
         return shifted, shifted_mel - envelope(shifted_mel) + envelope(mel), factor
@@ -272,7 +274,7 @@ def main():
         picks = random.choices(range(len(clips)), k=n)
         waves = [clips[i].to(DEVICE) for i in picks]
         mels = [mel_spectrogram(w[None], **mel_args)[0] for w in waves]
-        # Both conditions get the clip's own F0: it is the pitch of the mel being learned, which is what the engine feeds (the input's F0, transposed) at conversion time. Padded like the content features, so the length regulator stretches both onto the mel frames the same way.
+        # Both conditions get the clip's own F0, as the engine feeds the input's F0.
         f0 = (
             torch.nn.utils.rnn.pad_sequence(
                 [clip_f0[i] for i in picks], batch_first=True
@@ -312,7 +314,7 @@ def main():
 
             waves_16k = torchaudio.functional.resample(waves, sr, 16000)
             lengths_16k = (wave_lengths.float() * 16000 / sr).long()
-            # Content for the prompt part comes from the prompt's own audio, as in the engine (the reference).
+            # Prompt content comes from the prompt's own audio, as in the engine.
             S_ori = content_features(
                 torchaudio.functional.resample(prompt_waves, sr, 16000)
             )
@@ -341,7 +343,8 @@ def main():
         loss, _ = model.cfm(mels, mel_lengths, prompt_len, cond, style)
         return loss
 
-    # Full forward passes of BATCH_SIZE plus one smaller pass for any remainder. The loss is a per-clip mean, so weighting each pass by its share of the clips gives the same gradient as a single EFFECTIVE_BATCH_SIZE batch.
+    # The loss is a per-clip mean, so weighting each micro-batch by its share of the clips gives
+    # the gradient of one EFFECTIVE_BATCH_SIZE batch.
     micro_batches = [BATCH_SIZE] * (EFFECTIVE_BATCH_SIZE // BATCH_SIZE)
     if EFFECTIVE_BATCH_SIZE % BATCH_SIZE:
         micro_batches.append(EFFECTIVE_BATCH_SIZE % BATCH_SIZE)

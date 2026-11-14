@@ -20,9 +20,7 @@ def str2bool(v):
 class StreamNoise:
     """One Gaussian noise sequence for a whole stream, addressed by absolute position.
 
-    Overlapping windows that ask for the same position get the same values. Values are drawn
-    on first request and dropped once they fall behind the window being asked for, so memory
-    stays bounded however long the stream runs. Windows must move forward only.
+    Windows must only move forward; values behind the latest window are dropped.
     """
 
     def __init__(self, channels, device):

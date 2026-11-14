@@ -22,7 +22,7 @@ if sys.platform == "darwin":
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
-# Resolve config paths against this script, not the CWD: the launcher may start us from anywhere, and unified_launcher.py restores the CWD to the repo root after initialising the engine.
+# Relative to this script, not the CWD, which the external launcher changes.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.join(SCRIPT_DIR, "configs", "config.json")
 INUSE_CONFIG_DIR = os.path.join(SCRIPT_DIR, "configs", "inuse")
@@ -47,7 +47,7 @@ class GUI:
 
         self.function = "vc"
 
-        # Shared memory is the IPC channel for the legacy two-process launcher (launcher.py): this GUI publishes the measured audio latency so the separate video process can sync to it. The engine itself stays free of any sync/IPC concern--it only reports its timings via on_perf_update.
+        # Publishes the measured latency for the external video process to sync to.
         self.shm = None
         shm_name = os.environ.get("RAS_SHARED_MEM_NAME")
         if shm_name:
@@ -71,7 +71,7 @@ class GUI:
 
     def update_perf_stats(self, infer_time, _delay_time, measured_delay_time):
         """Callback to update UI with performance stats"""
-        # Publish every callback (cheap) so the video process tracks latency promptly; the UI update below stays throttled.
+        # Every call, so video tracks latency promptly; only the UI update is throttled.
         self.publish_audio_delay(measured_delay_time)
 
         if time.time() - self.last_gui_update < 0.1:
@@ -104,7 +104,7 @@ class GUI:
                     ):
                         self.update_devices()
                         data["sg_hostapi"] = self.engine.hostapis[0]
-                        # Safe fallback: the host API default, never devices[0] (that is the monitor's HDMI audio on a typical Linux box).
+                        # Not devices[0]: on Linux that's usually the monitor's HDMI audio.
                         data["sg_input_device"] = self.engine.preferred_device("input")
                         data["sg_output_device"] = self.engine.preferred_device(
                             "output"
@@ -439,7 +439,7 @@ class GUI:
                 self.engine.set_config(function=event)
 
             elif event == "stop_vc":
-                # Only an explicit stop stops the stream--not any other control event. Settings that need new buffers are applied on the next start; reloading devices stops the stream inside update_devices.
+                # Only explicit stops (and device reloads) end the stream.
                 self.engine.stop_stream()
                 self.publish_audio_delay(0.0)  # tell the video process audio is idle
 
@@ -480,7 +480,7 @@ if __name__ == "__main__":
         "--checkpoint-path", type=str, default=None, help="Path to the model checkpoint"
     )
     parser.add_argument(
-        "--config-path", type=str, default=None, help="Path to the vocoder checkpoint"
+        "--config-path", type=str, default=None, help="Path to the model config (.yml)"
     )
     parser.add_argument(
         "--fp16",

@@ -166,18 +166,10 @@ class ResBlock(torch.nn.Module):
 class ExcitationStream:
     """Excitation state shared by the overlapping vocoder windows of one stream.
 
-    A streaming caller re-vocodes a window that mostly overlaps the previous one. Without
-    this, SineGen starts every window's harmonics at phase zero on its first sample, redraws
-    the harmonic phase offsets and redraws the noise. Two windows covering the same instant
-    then drive the filter with different source signals, and the crossfade between them mixes
-    two waveforms that do not line up. With it:
-      - the fundamental's phase continues from the previous window: at the sample the caller
-        names as `align` (where the two windows get crossfaded) it matches the phase the
-        previous window had there;
-      - the harmonic phase offsets are drawn once, here, for the whole stream;
-      - the noise comes from one stream-long sequence read by absolute sample.
-    Positions are absolute sample indices at the vocoder's output rate, counted however the
-    caller likes as long as overlapping windows agree on them.
+    Overlapping windows get the same source signal, so their crossfade lines up: the
+    fundamental's phase continues from the previous window (matched at `align`), the harmonic
+    phase offsets are drawn once, and the noise is one stream-long sequence. Positions are
+    absolute output-rate sample indices.
     """
 
     def __init__(self, harmonic_num, device):
@@ -185,10 +177,9 @@ class ExcitationStream:
         offsets[:, 0] = 0  # as SineGen: the fundamental itself has no offset
         self.phase_offsets = offsets.to(device)
         self.noise = StreamNoise(harmonic_num + 1, device)
-        self._cycles = (
-            None  # the previous window's fundamental phase per sample (cycles, float64)
-        )
-        self._start = 0  # absolute index of that window's first sample
+        # The previous window's fundamental phase per sample (cycles, float64), and its start.
+        self._cycles = None
+        self._start = 0
 
     def continue_phase(self, cycles, start, align):
         """Offset `cycles` (this window's cumulative fundamental phase, [1, L]) so that at
