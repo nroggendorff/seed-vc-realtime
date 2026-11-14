@@ -17,6 +17,41 @@ def str2bool(v):
         raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
+class StreamNoise:
+    """One Gaussian noise sequence for a whole stream, addressed by absolute position.
+
+    Overlapping windows that ask for the same position get the same values. Values are drawn
+    on first request and dropped once they fall behind the window being asked for, so memory
+    stays bounded however long the stream runs. Windows must move forward only.
+    """
+
+    def __init__(self, channels, device):
+        self.channels = channels
+        self.device = device
+        self._buf = torch.empty(channels, 0, device=device)
+        self._base = 0  # absolute position of _buf[:, 0]
+
+    def window(self, start, length):
+        """Noise for absolute positions [start, start + length), shape [channels, length]."""
+        if start < self._base:
+            raise ValueError(
+                f"position {start} was already discarded (oldest kept is {self._base})"
+            )
+        have = self._base + self._buf.size(1)
+        if start >= have:
+            # A jump past everything drawn so far: nothing kept can be asked for again.
+            self._buf = self._buf[:, :0]
+            self._base = have = start
+        if start + length > have:
+            fresh = torch.randn(
+                self.channels, start + length - have, device=self.device
+            )
+            self._buf = torch.cat([self._buf, fresh], dim=1)
+        self._buf = self._buf[:, start - self._base :]
+        self._base = start
+        return self._buf[:, :length]
+
+
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
         super(AttrDict, self).__init__(*args, **kwargs)
@@ -414,6 +449,11 @@ def load_checkpoint(
             if skipped_keys:
                 print(
                     f"Warning: Skipped loading some keys due to shape mismatch: {skipped_keys}"
+                )
+            missing_keys = set(model_state_dict) - set(filtered_state_dict)
+            if missing_keys:
+                print(
+                    f"Note: {key} keeps its initial values for keys the checkpoint lacks: {sorted(missing_keys)}"
                 )
             print("%s loaded" % key)
             model[key].load_state_dict(filtered_state_dict, strict=False)

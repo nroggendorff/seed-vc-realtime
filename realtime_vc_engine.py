@@ -4,6 +4,7 @@ import time
 import threading
 import traceback
 import warnings
+from collections import deque
 import yaml
 import numpy as np
 import torch
@@ -16,6 +17,7 @@ from audio_modules.commons import (
     recursive_munch,
     build_model,
     load_checkpoint,
+    StreamNoise,
 )
 
 now_dir = os.getcwd()
@@ -52,6 +54,17 @@ MAX_PLAUSIBLE_LATENCY_S = 5.0
 # (1x0 and 400x140)". Measured: 40ms fails, 60ms works.
 MIN_VAD_CHUNK_MS = 60
 
+# Pitch conditioning (F0 models only). RMVPE gets this much audio left of the DiT's span so its first frames are not edge frames, then that part is dropped.
+F0_CONTEXT_S = 0.2
+# Source register = median log-F0 of the input's voiced frames over this long. Long enough that the transposition barely moves block to block; a moving shift would itself make overlapping windows disagree on pitch.
+F0_HISTORY_S = 60.0
+# Below this much voiced history, the current window's frames are added to the estimate.
+F0_HISTORY_MIN_S = 1.0
+# RMVPE voicing threshold, as seed-vc's offline inference uses.
+F0_THRESHOLD = 0.03
+# The reference's register is measured over at most this much of it.
+F0_REFERENCE_MAX_S = 30.0
+
 
 class RealtimeVCConfig:
     def __init__(self):
@@ -70,6 +83,9 @@ class RealtimeVCConfig:
         self.max_prompt_length = 3.0
         # Prompt each chunk with the mel the previous chunk generated for the DiT's left context, so the DiT continues the pitch and timbre it just played instead of picking them afresh every block.
         self.chunk_continuity = True
+        # F0 models only: transpose the input's pitch so its median lands on the reference's median (cross-gender conversion needs this), then shift by pitch_shift semitones.
+        self.f0_auto_adjust = True
+        self.pitch_shift = 0.0
         self.sg_hostapi = ""
         self.wasapi_exclusive = False
         self.sg_input_device = ""
@@ -115,6 +131,7 @@ class RealtimeVCEngine:
         self.mel2 = None
         self.style2 = None
         self.prev_mel = None  # last chunk's DiT-region mel, for chunk_continuity
+        self._ref_log_f0 = None  # reference's median log2-F0 (F0 models only)
         self.reference_wav_name = ""
         self.prompt_len = 3
         self.ce_dit_difference = 2.0
@@ -187,6 +204,26 @@ class RealtimeVCEngine:
             model[key].eval()
             model[key].to(self.device)
         model.cfm.estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
+
+        # Pitch conditioning: an F0 model gets the input's pitch explicitly instead of having to infer it from content features that carry almost none. Off for models without an F0 embedding, and for an F0 config whose checkpoint never trained one (the embedding is zero-initialised, so it would add nothing and RMVPE would run for nothing).
+        self.rmvpe = None
+        if model.length_regulator.f0_condition:
+            if not model.length_regulator.f0_embedding.weight.any():
+                print(
+                    "Warning: the config enables F0 conditioning but the checkpoint has no trained "
+                    "F0 embedding; running without pitch conditioning. Finetune with F0 to use it."
+                )
+            else:
+                from audio_modules.rmvpe import RMVPE
+
+                self.rmvpe = RMVPE(
+                    load_custom_model_from_hf(
+                        "lj1995/VoiceConversionWebUI", "rmvpe.pt", None
+                    ),
+                    is_half=False,
+                    device=self.device,
+                )
+                print("Pitch conditioning: on (RMVPE)")
 
         from audio_modules.campplus.DTDNN import CAMPPlus
 
@@ -572,6 +609,26 @@ class RealtimeVCEngine:
             self.resampler2 = None
 
         self.prev_mel = None
+
+        # Per-stream state that lets overlapping windows line up. Every block moves the window on by exactly block_frame, so block counts give absolute positions: window b starts _block_shift_samples * b model-rate samples into the stream (plus a constant that cancels out). At 22.05 kHz with hop 256 and a 0.24 s block that is 5292 samples, i.e. 20.67 mel frames.
+        sr_model = self.model_set[-1]["sampling_rate"]
+        self._block_shift_samples = (self.block_frame // self.zc) * sr_model // 50
+        self._block_index = 0
+        # One noise sequence for the DiT's whole stream, read by absolute mel frame.
+        self._dit_noise = StreamNoise(self.model_set[-1]["num_mels"], self.device)
+        vocoder_fn = self.model_set[2]
+        # HiFT only: its excitation phase, harmonic offsets and noise follow the stream.
+        self._vocoder_stream = (
+            vocoder_fn.new_stream() if hasattr(vocoder_fn, "new_stream") else None
+        )
+        self._sola_offset = 0  # last SOLA shift (output-rate samples)
+        # Source pitch register for F0 models: voiced log2-F0 of the input, newest last.
+        self._src_log_f0 = deque(maxlen=int(F0_HISTORY_S * 100))
+        # Input F0 by absolute RMVPE frame (100/s), estimated once per frame for the stream; see _source_f0. A block moves the 16 kHz window by a whole number of these frames.
+        self._f0_shift = (self.block_frame // self.zc) * 2
+        self._f0_cache = np.zeros(0)
+        self._f0_cache_start = 0  # absolute frame of _f0_cache[0]
+
         self.vad_cache = {}
         # Keep the VAD chunk within what FSMN-VAD can handle, independent of block_time: the slider goes down to 0.04s, which is below the model's minimum. _audio_callback accumulates audio to fill exactly this much.
         self.vad_chunk_size = min(
@@ -746,8 +803,31 @@ class RealtimeVCEngine:
 
             self.mel2 = to_mel(reference_wav_tensor.unsqueeze(0))
             target2_lengths = torch.LongTensor([self.mel2.size(2)]).to(self.mel2.device)
+            f0_ori = None
+            if self.rmvpe is not None:
+                # The prompt is conditioned on its own pitch, as in training.
+                f0_ori = (
+                    torch.from_numpy(
+                        self.rmvpe.infer_from_audio(ori_waves_16k, thred=F0_THRESHOLD)
+                    )
+                    .float()
+                    .to(self.device)[None]
+                )
+                # The register to transpose the input into, measured on more of the reference than the prompt slice.
+                ref_16k = torchaudio.functional.resample(
+                    torch.from_numpy(
+                        self.reference_wav[: int(sr * F0_REFERENCE_MAX_S)]
+                    ).to(self.device),
+                    sr,
+                    16000,
+                )
+                ref_f0 = self.rmvpe.infer_from_audio(ref_16k, thred=F0_THRESHOLD)
+                ref_f0 = ref_f0[ref_f0 > 0]
+                self._ref_log_f0 = (
+                    float(np.median(np.log2(ref_f0))) if len(ref_f0) else None
+                )
             self.prompt_condition = model.length_regulator(
-                S_ori, ylens=target2_lengths, n_quantizers=3, f0=None
+                S_ori, ylens=target2_lengths, n_quantizers=3, f0=f0_ori
             )[0]
             self.reference_wav_name = self.config.reference_audio_path
             self.prev_mel = None
@@ -755,25 +835,47 @@ class RealtimeVCEngine:
         S_alt = semantic_fn(input_wav_res.unsqueeze(0))
 
         ce_dit_frame_difference = int(self.ce_dit_difference * 50)
-        S_alt = S_alt[:, ce_dit_frame_difference:]
+
+        def mel_frames(content_frames):
+            return int(content_frames / 50 * sr // hop_length)
+
+        n_window = self.skip_head + self.return_length + self.skip_tail
         target_lengths = torch.LongTensor(
-            [
-                (
-                    self.skip_head
-                    + self.return_length
-                    + self.skip_tail
-                    - ce_dit_frame_difference
-                )
-                / 50
-                * sr
-                // hop_length
-            ]
+            [mel_frames(n_window - ce_dit_frame_difference)]
         ).to(S_alt.device)
 
-        cond = model.length_regulator(
-            S_alt, ylens=target_lengths, n_quantizers=3, f0=None
-        )[0]
+        if self.rmvpe is None:
+            cond = model.length_regulator(
+                S_alt[:, ce_dit_frame_difference:],
+                ylens=target_lengths,
+                n_quantizers=3,
+            )[0]
+        else:
+            # F0 models: run the length regulator over the whole content window, then keep the DiT's span. Its GroupNorms normalise over whatever span they are given, and over the DiT's span alone (under a second) the pitch hardly varies, so the F0 embedding mostly cancels out. Training runs it over whole clips. Measured at 0.24 s blocks: a +4 semitone pitch_shift moved the output +1.1 -> +1.7 semitones, and the output's pitch contour follows the input's far more closely (log-F0 correlation 0.83 -> 0.95). Not done for models without F0: with the base checkpoint it made seams worse (90th-percentile seam step 113 -> 137 cents).
+            cond = model.length_regulator(
+                S_alt,
+                ylens=torch.LongTensor([mel_frames(n_window)]).to(S_alt.device),
+                n_quantizers=3,
+                f0=self._source_f0(input_wav_res, ce_dit_frame_difference),
+            )[0][:, -int(target_lengths[0]) :]
         cat_condition = torch.cat([self.prompt_condition, cond], dim=1)
+
+        # Starting noise from the stream-long sequence, by absolute mel frame. A block moves the window a non-integer number of frames (20.67 at 0.24 s), so each window takes the nearest frame. Where two windows overlap they now start from the same noise, so they tend to resolve it the same way, pitch included, instead of each picking its own (measured: median pitch disagreement between neighbouring windows 51 -> 32 cents, at 0.24 s blocks). The prompt span is zeroed by the solver; its noise is never used.
+        start_frame = int(
+            round(self._block_index * self._block_shift_samples / hop_length)
+        )
+        noise = torch.cat(
+            [
+                torch.zeros(
+                    1,
+                    mel_fn_args["num_mels"],
+                    self.prompt_condition.size(1),
+                    device=self.device,
+                ),
+                self._dit_noise.window(start_frame, cond.size(1))[None],
+            ],
+            dim=2,
+        )
 
         # The DiT's left context (extra_time) is audio the previous chunk already generated and played: this chunk's window is the previous one moved on by one block. Feeding that mel in as a prompt continuation makes the DiT continue it, as in training, where the prompt is the start of the same utterance. Without it, each chunk re-decides pitch from noise, which audibly jumps at chunk boundaries.
         prompt_mel = self.mel2
@@ -805,6 +907,7 @@ class RealtimeVCEngine:
                 self.style2,
                 n_timesteps=int(self.config.diffusion_steps),
                 inference_cfg_rate=self.config.inference_cfg_rate,
+                noise=noise,
             )
             vc_target = vc_target[:, :, self.mel2.size(-1) :]
             if left:
@@ -813,11 +916,71 @@ class RealtimeVCEngine:
                     [prompt_mel[:, :, -left:], vc_target[:, :, left:]], dim=2
                 )
             self.prev_mel = vc_target.float()
-            vc_wave = vocoder_fn(vc_target).squeeze()
+            output_len = self.return_length * sr // 50
+            tail_len = self.skip_tail * sr // 50
+            if self._vocoder_stream is not None:
+                # Window b's first output sample sits _block_shift_samples * b into the stream. Its excitation phase is matched to the previous window's at the centre of the crossfade the two will share: the played part starts output_len + tail_len before the end, and SOLA lands at the previous block's offset when the blocks line up, because that is where their absolute times coincide.
+                win_start = self._block_index * self._block_shift_samples
+                to_model = sr / self.config.samplerate
+                align = (
+                    win_start
+                    + vc_target.size(2) * hop_length
+                    - output_len
+                    - tail_len
+                    + int(
+                        round(
+                            (self._sola_offset + self.sola_buffer_frame / 2) * to_model
+                        )
+                    )
+                )
+                vc_wave = vocoder_fn(
+                    vc_target,
+                    stream=self._vocoder_stream,
+                    start=win_start,
+                    align=align,
+                ).squeeze()
+            else:
+                vc_wave = vocoder_fn(vc_target).squeeze()
 
-        output_len = self.return_length * sr // 50
-        tail_len = self.skip_tail * sr // 50
         return vc_wave[-output_len - tail_len : -tail_len]
+
+    def _source_f0(self, input_wav_res, skip_frames):
+        """Input F0 over the whole window, transposed into the reference's register: [1, n] Hz
+        at 100 frames/s, 0 where unvoiced. The length regulator stretches it onto the mel frames.
+        RMVPE only runs on the DiT's span (from skip_frames 20 ms frames on, plus some context);
+        the older part comes from earlier windows, or is 0 where none covered it."""
+        ctx = min(skip_frames, int(F0_CONTEXT_S * 50))
+        tail = self.rmvpe.infer_from_audio(
+            input_wav_res[(skip_frames - ctx) * 320 :], thred=F0_THRESHOLD
+        )[2 * ctx :]
+        f0 = np.zeros(2 * skip_frames + len(tail), dtype=tail.dtype)
+        f0[2 * skip_frames :] = tail
+
+        # Each frame keeps the value it got the first time it left the look-ahead, for as long as later windows still cover it. Re-estimating it in every window gives overlapping windows slightly different pitch for the same audio (measured: ~1 cent median, 1.4% of frames flip voicing). The look-ahead itself is re-estimated each time; it is never played.
+        n_right = int(round(self.extra_frame_right / self.config.samplerate * 100))
+        n_new = int(round(self.block_frame / self.config.samplerate * 100))
+        hi = len(f0) - n_right
+        start = self._block_index * self._f0_shift
+        offset = start - self._f0_cache_start
+        if 0 <= offset < len(self._f0_cache):
+            cached = self._f0_cache[offset:][:hi]
+            f0[: len(cached)] = cached
+        self._f0_cache, self._f0_cache_start = f0[:hi].copy(), start
+        voiced = f0 > 0
+
+        # Feed the register estimate only from audio new this block, so each instant counts once. The newest block sits just left of the look-ahead.
+        new = f0[max(0, hi - n_new) : hi]
+        self._src_log_f0.extend(np.log2(new[new > 0]))
+
+        semitones = float(self.config.pitch_shift)
+        if self.config.f0_auto_adjust and self._ref_log_f0 is not None:
+            history = np.fromiter(self._src_log_f0, dtype=np.float64)
+            if len(history) < F0_HISTORY_MIN_S * 100:
+                history = np.concatenate([history, np.log2(f0[voiced])])
+            if len(history):
+                semitones += 12 * (self._ref_log_f0 - float(np.median(history)))
+        f0 = np.where(voiced, f0 * 2 ** (semitones / 12), 0.0)
+        return torch.from_numpy(f0).float().to(self.device)[None]
 
     def _measure_latency(self, times):
         """Real capture->playback latency (s) from PortAudio timestamps, or None.
@@ -1033,6 +1196,8 @@ class RealtimeVCEngine:
 
         self.input_wav[: -self.block_frame] = self.input_wav[self.block_frame :].clone()
         self.input_wav[-indata.shape[0] :] = torch.from_numpy(indata).to(self.device)
+        # The window just moved on by one block, whatever happens to it below.
+        self._block_index += 1
 
         self.input_wav_res[: -self.block_frame_16k] = self.input_wav_res[
             self.block_frame_16k :
@@ -1098,7 +1263,8 @@ class RealtimeVCEngine:
         else:
             sola_offset = tensor.item()
 
-        infer_wav = infer_wav[int(sola_offset) :]
+        self._sola_offset = int(sola_offset)
+        infer_wav = infer_wav[self._sola_offset :]
         infer_wav[: self.sola_buffer_frame] *= self.fade_in_window
         infer_wav[: self.sola_buffer_frame] += self.sola_buffer * self.fade_out_window
         self.sola_buffer[:] = infer_wav[

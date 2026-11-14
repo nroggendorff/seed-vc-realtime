@@ -73,6 +73,8 @@ class InterpolateRegulator(nn.Module):
 
         if f0_condition:
             self.f0_embedding = nn.Embedding(n_f0_bins, channels)
+            # Zero, not nn.Embedding's N(0, 1): a checkpoint trained without F0 then loads into an F0 model unchanged (the embedding adds nothing until finetuning teaches it something), instead of having random vectors added to every frame's content.
+            nn.init.zeros_(self.f0_embedding.weight)
             self.f0_condition = f0_condition
             self.n_f0_bins = n_f0_bins
             self.f0_bins = torch.arange(2, 1024, 1024 // n_f0_bins)

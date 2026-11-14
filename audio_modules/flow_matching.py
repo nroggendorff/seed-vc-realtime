@@ -38,6 +38,7 @@ class BASECFM(torch.nn.Module, ABC):
         n_timesteps,
         temperature=1.0,
         inference_cfg_rate=0.5,
+        noise=None,
     ):
         """Forward diffusion
 
@@ -51,13 +52,25 @@ class BASECFM(torch.nn.Module, ABC):
             spks (torch.Tensor, optional): speaker ids. Defaults to None.
                 shape: (batch_size, spk_emb_dim)
             cond: Not used but kept for future purposes
+            noise (torch.Tensor, optional): the starting noise, shape
+                (batch_size, in_channels, mel_timesteps). Drawn fresh when None. A streaming
+                caller passes noise taken from one stream-long sequence, so overlapping
+                windows start from the same values where they overlap.
 
         Returns:
             sample: generated mel-spectrogram
                 shape: (batch_size, n_feats, mel_timesteps)
         """
         B, T = mu.size(0), mu.size(1)
-        z = torch.randn([B, self.in_channels, T], device=mu.device) * temperature
+        if noise is None:
+            z = torch.randn([B, self.in_channels, T], device=mu.device) * temperature
+        else:
+            if noise.shape != (B, self.in_channels, T):
+                raise ValueError(
+                    f"noise has shape {tuple(noise.shape)}, expected {(B, self.in_channels, T)}"
+                )
+            # A new tensor: solve_euler writes into z in place.
+            z = noise.to(device=mu.device, dtype=torch.float32) * temperature
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)
         return self.solve_euler(
             z, x_lens, prompt, mu, style, t_span, inference_cfg_rate

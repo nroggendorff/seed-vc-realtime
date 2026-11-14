@@ -29,6 +29,8 @@ from torch.distributions.uniform import Uniform
 from torch import sin
 from torch.nn.parameter import Parameter
 
+from audio_modules.commons import StreamNoise
+
 
 """hifigan based generator implementation.
 
@@ -161,6 +163,47 @@ class ResBlock(torch.nn.Module):
             remove_weight_norm(self.convs2[idx])
 
 
+class ExcitationStream:
+    """Excitation state shared by the overlapping vocoder windows of one stream.
+
+    A streaming caller re-vocodes a window that mostly overlaps the previous one. Without
+    this, SineGen starts every window's harmonics at phase zero on its first sample, redraws
+    the harmonic phase offsets and redraws the noise. Two windows covering the same instant
+    then drive the filter with different source signals, and the crossfade between them mixes
+    two waveforms that do not line up. With it:
+      - the fundamental's phase continues from the previous window: at the sample the caller
+        names as `align` (where the two windows get crossfaded) it matches the phase the
+        previous window had there;
+      - the harmonic phase offsets are drawn once, here, for the whole stream;
+      - the noise comes from one stream-long sequence read by absolute sample.
+    Positions are absolute sample indices at the vocoder's output rate, counted however the
+    caller likes as long as overlapping windows agree on them.
+    """
+
+    def __init__(self, harmonic_num, device):
+        offsets = torch.empty(1, harmonic_num + 1, 1).uniform_(-np.pi, np.pi)
+        offsets[:, 0] = 0  # as SineGen: the fundamental itself has no offset
+        self.phase_offsets = offsets.to(device)
+        self.noise = StreamNoise(harmonic_num + 1, device)
+        self._cycles = (
+            None  # the previous window's fundamental phase per sample (cycles, float64)
+        )
+        self._start = 0  # absolute index of that window's first sample
+
+    def continue_phase(self, cycles, start, align):
+        """Offset `cycles` (this window's cumulative fundamental phase, [1, L]) so that at
+        absolute sample `align` it equals the previous window's phase there. Only the
+        fractional part of the offset matters, so the values stay small."""
+        if self._cycles is not None and align is not None:
+            i_prev, i_cur = align - self._start, align - start
+            if 0 <= i_prev < self._cycles.size(-1) and 0 <= i_cur < cycles.size(-1):
+                cycles = (
+                    cycles + ((self._cycles[:, i_prev] - cycles[:, i_cur]) % 1)[:, None]
+                )
+        self._cycles, self._start = cycles, start
+        return cycles
+
+
 class SineGen(torch.nn.Module):
     """Definition of sine generator
     SineGen(samp_rate, harmonic_num = 0,
@@ -196,11 +239,17 @@ class SineGen(torch.nn.Module):
         return (f0 > self.voiced_threshold).type(torch.float32)
 
     @torch.no_grad()
-    def forward(self, f0):
+    def forward(self, f0, stream=None, start=0, align=None):
         """
         :param f0: [B, 1, sample_len], Hz
+        :param stream: optional ExcitationStream; when given, the phase, harmonic offsets
+            and noise follow the stream instead of starting afresh (B must be 1)
+        :param start: absolute index of this window's first sample, for the stream
+        :param align: absolute sample at which to match the previous window's phase
         :return: [B, 1, sample_len]
         """
+        if stream is not None:
+            return self._forward_stream(f0, stream, start, align)
 
         F_mat = torch.zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1))).to(
             f0.device
@@ -224,6 +273,28 @@ class SineGen(torch.nn.Module):
         #        for voiced regions is self.noise_std
         noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
         noise = noise_amp * torch.randn_like(sine_waves)
+
+        return sine_waves * uv + noise, uv, noise
+
+    def _forward_stream(self, f0, stream, start, align):
+        if f0.size(0) != 1:
+            raise ValueError(
+                "a streaming excitation takes one window at a time (batch 1)"
+            )
+        # float64 and outside autocast: the cumulative phase must stay exact across windows.
+        with torch.autocast(f0.device.type, enabled=False):
+            cycles = torch.cumsum(f0[:, 0].double() / self.sampling_rate, dim=-1)
+            cycles = stream.continue_phase(cycles, start, align)
+            harmonics = torch.arange(
+                1, self.harmonic_num + 2, device=f0.device, dtype=torch.float64
+            )
+            # Harmonic k's phase is k times the fundamental's, as in forward().
+            theta = 2 * np.pi * ((cycles[:, None, :] * harmonics[None, :, None]) % 1)
+            sine_waves = self.sine_amp * torch.sin(theta.float() + stream.phase_offsets)
+
+            uv = self._f02uv(f0)
+            noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
+            noise = noise_amp * stream.noise.window(start, f0.size(-1))[None]
 
         return sine_waves * uv + noise, uv, noise
 
@@ -267,16 +338,17 @@ class SourceModuleHnNSF(torch.nn.Module):
         self.l_linear = torch.nn.Linear(harmonic_num + 1, 1)
         self.l_tanh = torch.nn.Tanh()
 
-    def forward(self, x):
+    def forward(self, x, stream=None, start=0, align=None):
         """
         Sine_source, noise_source = SourceModuleHnNSF(F0_sampled)
         F0_sampled (batchsize, length, 1)
         Sine_source (batchsize, length, 1)
         noise_source (batchsize, length 1)
+        stream/start/align: see SineGen.forward
         """
         # source for harmonic branch
         with torch.no_grad():
-            sine_wavs, uv, _ = self.l_sin_gen(x.transpose(1, 2))
+            sine_wavs, uv, _ = self.l_sin_gen(x.transpose(1, 2), stream, start, align)
             sine_wavs = sine_wavs.transpose(1, 2)
             uv = uv.transpose(1, 2)
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
@@ -403,10 +475,14 @@ class HiFTGenerator(nn.Module):
         )
         self.f0_predictor = f0_predictor
 
-    def _f02source(self, f0: torch.Tensor) -> torch.Tensor:
+    def new_stream(self) -> ExcitationStream:
+        """Excitation state for one stream of overlapping windows; pass it to forward()."""
+        return ExcitationStream(self.nb_harmonics, next(self.parameters()).device)
+
+    def _f02source(self, f0: torch.Tensor, stream=None, start=0, align=None):
         f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
 
-        har_source, _, _ = self.m_source(f0)
+        har_source, _, _ = self.m_source(f0, stream, start, align)
         return har_source.transpose(1, 2)
 
     def _stft(self, x):
@@ -434,10 +510,16 @@ class HiFTGenerator(nn.Module):
         )
         return inverse_transform
 
-    def forward(self, x: torch.Tensor, f0=None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, f0=None, stream=None, start=0, align=None
+    ) -> torch.Tensor:
+        """x: mel [B, 80, T]. stream/start/align: see SineGen.forward; the output has
+        T * 256 samples, and `start` is the absolute index of the first."""
         if f0 is None:
             f0 = self.f0_predictor(x)
-        s_stft_real, s_stft_imag = self._stft(self._f02source(f0).squeeze(1))
+        s_stft_real, s_stft_imag = self._stft(
+            self._f02source(f0, stream, start, align).squeeze(1)
+        )
         s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
 
         x = self.conv_pre(x)
@@ -481,5 +563,5 @@ class HiFTGenerator(nn.Module):
             l.remove_weight_norm()
 
     @torch.inference_mode()
-    def inference(self, mel: torch.Tensor, f0=None) -> torch.Tensor:
-        return self.forward(x=mel, f0=f0)
+    def inference(self, mel: torch.Tensor, f0=None, **stream_kwargs) -> torch.Tensor:
+        return self.forward(x=mel, f0=f0, **stream_kwargs)

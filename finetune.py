@@ -2,6 +2,7 @@ import math
 import os
 import random
 import shutil
+from fractions import Fraction
 
 import librosa
 import numpy as np
@@ -25,9 +26,43 @@ SAVE_EVERY = 100
 MIN_SECONDS = 1.0  # shorter clips are skipped
 MAX_SECONDS = 30.0  # longer files are split into equal pieces no longer than this
 MAX_VRAM_GB = 10.0
+# Pitch conditioning: feed the model each clip's F0 (RMVPE) alongside the content, so at conversion time the input's pitch drives the output's instead of the model inferring it from content features that carry almost none. Turns on f0_condition in the run's config. The F0 embedding starts at zero, so training starts from the base model's behaviour, and it gets its own, higher learning rate: at LEARNING_RATE it would barely move from zero in a finetune this short.
+F0_CONDITION = True
+F0_LEARNING_RATE = 1e-3
+F0_THRESHOLD = 0.03  # RMVPE voicing threshold; keep it equal to the engine's
+# Optional, off by default: for this share of clips the prompt part (the start of the same clip, which otherwise gives away the target's pitch register) is pitch-shifted by a random whole number of semitones up to F0_SHIFT_MAX, with its F0 shifted to match, while the part being learned stays as recorded, so the F0 is the only reliable cue to the target's pitch. The shift keeps the spectral envelope (formants), so the prompt still sounds like the same speaker. Measured with 0.7 over 1000 steps on 13 min of one voice: offline (whole utterances) the output followed 3.3 of 6 requested semitones instead of 2.1-2.4, but in the real-time engine it followed no better (+1.7 of +4 either way) and its seams were worse (90th-percentile seam step 134 vs 120 cents).
+F0_SHIFT_SHARE = 0.0
+F0_SHIFT_MAX = 4
+F0_SHIFT_ENVELOPE = 20  # cepstral coefficients over mel bins kept as the envelope; more starts eating the harmonics of high voices
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg", ".m4a", ".opus")
+
+
+def pitch_shift(wave, k, n_fft=1024):
+    """Pitch-shift a 1-D wave by about k semitones, keeping its length; returns (wave, exact pitch factor).
+    Phase-vocoder time stretch, then resampling back to the original duration. The factor is rounded to
+    a fraction with a small denominator (63/50 for +4: 0.1 cent off), which keeps the resampling
+    kernel tiny; torchaudio's PitchShift resamples by e.g. 27781/22050, whose kernel takes gigabytes.
+    """
+    factor = Fraction(2 ** (k / 12)).limit_denominator(64)
+    hop = n_fft // 4
+    window = torch.hann_window(n_fft, device=wave.device)
+    spec = torch.stft(wave, n_fft, hop, window=window, return_complex=True)
+    phase_advance = torch.linspace(0, math.pi * hop, spec.size(-2), device=wave.device)[
+        :, None
+    ]
+    spec = torchaudio.functional.phase_vocoder(spec, 1 / float(factor), phase_advance)
+    stretched = torch.istft(
+        spec, n_fft, hop, window=window, length=round(len(wave) * float(factor))
+    )
+    shifted = torchaudio.functional.resample(
+        stretched, factor.numerator, factor.denominator
+    )
+    shifted = torch.nn.functional.pad(
+        shifted[: len(wave)], (0, max(0, len(wave) - len(shifted)))
+    )
+    return shifted, float(factor)
 
 
 def load_clips(sr):
@@ -73,7 +108,10 @@ def main():
     from hf_utils import load_custom_model_from_hf
 
     config = yaml.safe_load(open(CONFIG_PATH))
+    if F0_CONDITION:
+        config["model_params"]["length_regulator"]["f0_condition"] = True
     params = recursive_munch(config["model_params"])
+    use_f0 = bool(params.length_regulator.get("f0_condition", False))
     params.dit_type = "DiT"
     if params.speech_tokenizer.type != "xlsr":
         raise SystemExit("Only the xlsr (real-time) configs are supported.")
@@ -94,8 +132,34 @@ def main():
 
     run_dir = os.path.join("runs", RUN_NAME)
     os.makedirs(run_dir, exist_ok=True)
-    shutil.copyfile(CONFIG_PATH, os.path.join(run_dir, "config.yml"))
+    if F0_CONDITION:
+        # The engine reads f0_condition from this copy, so it must carry the override.
+        with open(os.path.join(run_dir, "config.yml"), "w") as f:
+            yaml.safe_dump(config, f, sort_keys=False)
+    else:
+        shutil.copyfile(CONFIG_PATH, os.path.join(run_dir, "config.yml"))
     out_path = os.path.join(run_dir, "ft_model.pth")
+
+    clip_f0 = None
+    if use_f0:
+        from audio_modules.rmvpe import RMVPE
+
+        rmvpe = RMVPE(
+            load_custom_model_from_hf("lj1995/VoiceConversionWebUI", "rmvpe.pt"),
+            is_half=False,
+            device=DEVICE,
+        )
+        # Once per clip up front: clips are reused every step and RMVPE is the slow part. 100 frames/s, 0 where unvoiced.
+        clip_f0 = [
+            torch.from_numpy(
+                rmvpe.infer_from_audio(
+                    torchaudio.functional.resample(c, sr, 16000), thred=F0_THRESHOLD
+                )
+            ).float()
+            for c in tqdm(clips, desc="F0")
+        ]
+        del rmvpe
+        torch.cuda.empty_cache()
 
     model = build_model(params, stage="DiT")
     ckpt = PRETRAINED_CKPT or load_custom_model_from_hf(
@@ -112,8 +176,18 @@ def main():
     for key in model:
         model[key].to(DEVICE).train()
     model.cfm.estimator.setup_caches(max_batch_size=BATCH_SIZE, max_seq_length=8192)
+    lr_named = list(model.length_regulator.named_parameters())
+    param_groups = [
+        {
+            "params": list(model.cfm.parameters())
+            + [p for n, p in lr_named if not n.startswith("f0_")]
+        }
+    ]
+    f0_params = [p for n, p in lr_named if n.startswith("f0_")]
+    if f0_params:
+        param_groups.append({"params": f0_params, "lr": F0_LEARNING_RATE})
     optimizer = torch.optim.AdamW(
-        list(model.cfm.parameters()) + list(model.length_regulator.parameters()),
+        param_groups,
         lr=LEARNING_RATE,
         betas=(0.9, 0.98),
         eps=1e-6,
@@ -172,15 +246,60 @@ def main():
     def save():
         torch.save({"net": {key: model[key].state_dict() for key in model}}, out_path)
 
+    shift_steps = [k for k in range(-F0_SHIFT_MAX, F0_SHIFT_MAX + 1) if k]
+    n_mels = mel_args["num_mels"]
+    dct = torch.cos(
+        math.pi
+        / n_mels
+        * (torch.arange(n_mels)[None] + 0.5)
+        * torch.arange(n_mels)[:, None]
+    ) * math.sqrt(2 / n_mels)
+    dct[0] /= math.sqrt(2)  # orthonormal DCT-II over mel bins
+    dct = dct.to(DEVICE)
+    lifter = (torch.arange(n_mels, device=DEVICE) < F0_SHIFT_ENVELOPE).float()[:, None]
+
+    def envelope(log_mel):
+        return dct.T @ (lifter * (dct @ log_mel))
+
+    @torch.no_grad()
+    def shift_prompt(wave, mel, k):
+        """wave pitch-shifted by about k semitones, its log-mel carrying the unshifted mel's envelope, and the exact F0 factor."""
+        shifted, factor = pitch_shift(wave, k)
+        shifted_mel = mel_spectrogram(shifted[None], **mel_args)[0][:, : mel.size(1)]
+        return shifted, shifted_mel - envelope(shifted_mel) + envelope(mel), factor
+
     def compute_loss(n):
-        waves = [c.to(DEVICE) for c in random.choices(clips, k=n)]
+        picks = random.choices(range(len(clips)), k=n)
+        waves = [clips[i].to(DEVICE) for i in picks]
         mels = [mel_spectrogram(w[None], **mel_args)[0] for w in waves]
+        # Both conditions get the clip's own F0: it is the pitch of the mel being learned, which is what the engine feeds (the input's F0, transposed) at conversion time. Padded like the content features, so the length regulator stretches both onto the mel frames the same way.
+        f0 = (
+            torch.nn.utils.rnn.pad_sequence(
+                [clip_f0[i] for i in picks], batch_first=True
+            ).to(DEVICE)
+            if use_f0
+            else None
+        )
+        # The prompt's audio, mel and F0: as recorded, or pitch-shifted (see F0_SHIFT_SHARE).
+        prompt_waves, prompt_mels, prompt_f0 = list(waves), list(mels), f0
+        if use_f0 and F0_SHIFT_SHARE > 0:
+            prompt_f0 = f0.clone()
+            for i in range(n):
+                if random.random() < F0_SHIFT_SHARE:
+                    prompt_waves[i], prompt_mels[i], factor = shift_prompt(
+                        waves[i], mels[i], random.choice(shift_steps)
+                    )
+                    prompt_f0[i] *= factor
         wave_lengths = torch.tensor([len(w) for w in waves], device=DEVICE)
         mel_lengths = torch.tensor([m.size(1) for m in mels], device=DEVICE)
         waves = torch.nn.utils.rnn.pad_sequence(waves, batch_first=True)
-        mels = torch.nn.utils.rnn.pad_sequence(
-            [m.T for m in mels], batch_first=True, padding_value=-10
-        ).transpose(1, 2)
+        prompt_waves = torch.nn.utils.rnn.pad_sequence(prompt_waves, batch_first=True)
+        mels, prompt_mels = (
+            torch.nn.utils.rnn.pad_sequence(
+                [m.T for m in ms], batch_first=True, padding_value=-10
+            ).transpose(1, 2)
+            for ms in (mels, prompt_mels)
+        )
 
         with torch.no_grad():
             waves_22k = torchaudio.functional.resample(waves, sr, 22050)
@@ -193,7 +312,10 @@ def main():
 
             waves_16k = torchaudio.functional.resample(waves, sr, 16000)
             lengths_16k = (wave_lengths.float() * 16000 / sr).long()
-            S_ori = content_features(waves_16k)
+            # Content for the prompt part comes from the prompt's own audio, as in the engine (the reference).
+            S_ori = content_features(
+                torchaudio.functional.resample(prompt_waves, sr, 16000)
+            )
             S_alt = content_features(
                 torchaudio.functional.resample(converted_22k, 22050, 16000)
             )
@@ -206,14 +328,15 @@ def main():
                 style.append(campplus((feat - feat.mean(dim=0, keepdim=True))[None]))
             style = torch.cat(style)
 
-        ori_cond = model.length_regulator(S_ori, ylens=mel_lengths)[0]
-        alt_cond = model.length_regulator(S_alt, ylens=mel_lengths)[0]
+        ori_cond = model.length_regulator(S_ori, ylens=mel_lengths, f0=prompt_f0)[0]
+        alt_cond = model.length_regulator(S_alt, ylens=mel_lengths, f0=f0)[0]
 
         prompt_len = (torch.rand(n, device=DEVICE) * (mel_lengths - 1)).floor().long()
         prompt_len[torch.rand(n, device=DEVICE) < 0.1] = 0
         cond = alt_cond.clone()
         for i in range(n):
             cond[i, : prompt_len[i]] = ori_cond[i, : prompt_len[i]]
+            mels[i, :, : prompt_len[i]] = prompt_mels[i, :, : prompt_len[i]]
 
         loss, _ = model.cfm(mels, mel_lengths, prompt_len, cond, style)
         return loss
