@@ -939,7 +939,8 @@ class RealtimeVCEngine:
             else:
                 vc_wave = vocoder_fn(vc_target).squeeze()
 
-        return vc_wave[-output_len - tail_len : -tail_len]
+        # BigVGAN returns fp16 under autocast; SOLA needs fp32.
+        return vc_wave[-output_len - tail_len : -tail_len].float()
 
     def _source_f0(self, input_wav_res, skip_frames):
         """Input F0 for the window, transposed: [1, n] Hz at 100 frames/s, 0 where unvoiced.
