@@ -31,8 +31,9 @@ MAX_VRAM_GB = 10.0
 F0_CONDITION = True
 F0_LEARNING_RATE = 1e-3
 F0_THRESHOLD = 0.03  # RMVPE voicing threshold; keep it equal to the engine's
-# Share of clips whose prompt is pitch-shifted (formants kept) by up to F0_SHIFT_MAX semitones,
-# so F0 is the only reliable pitch cue. Off: it didn't help the real-time engine and hurt seams.
+# Share of clips whose target is pitch-shifted (formants kept) by up to F0_SHIFT_MAX semitones
+# while the prompt stays as recorded, as with the engine's pitch_shift. 0.5 makes the output
+# follow pitch_shift closely, but sounds less like the speaker and hurts seams, so it's off.
 F0_SHIFT_SHARE = 0.0
 F0_SHIFT_MAX = 4
 F0_SHIFT_ENVELOPE = 20  # cepstral coefficients in the envelope; more eats harmonics
@@ -264,11 +265,12 @@ def main():
         return dct.T @ (lifter * (dct @ log_mel))
 
     @torch.no_grad()
-    def shift_prompt(wave, mel, k):
-        """Shifted wave, its log-mel with the original envelope, and the exact F0 factor."""
+    def shift_mel(wave, mel, k):
+        """Log-mel of the wave shifted by about k semitones, with the original envelope, and
+        the exact F0 factor."""
         shifted, factor = pitch_shift(wave, k)
         shifted_mel = mel_spectrogram(shifted[None], **mel_args)[0][:, : mel.size(1)]
-        return shifted, shifted_mel - envelope(shifted_mel) + envelope(mel), factor
+        return shifted_mel - envelope(shifted_mel) + envelope(mel), factor
 
     def compute_loss(n):
         picks = random.choices(range(len(clips)), k=n)
@@ -282,25 +284,24 @@ def main():
             if use_f0
             else None
         )
-        # The prompt's audio, mel and F0: as recorded, or pitch-shifted (see F0_SHIFT_SHARE).
-        prompt_waves, prompt_mels, prompt_f0 = list(waves), list(mels), f0
+        # The target's mel and F0: as recorded, or pitch-shifted (see F0_SHIFT_SHARE).
+        target_mels, target_f0 = list(mels), f0
         if use_f0 and F0_SHIFT_SHARE > 0:
-            prompt_f0 = f0.clone()
+            target_f0 = f0.clone()
             for i in range(n):
                 if random.random() < F0_SHIFT_SHARE:
-                    prompt_waves[i], prompt_mels[i], factor = shift_prompt(
+                    target_mels[i], factor = shift_mel(
                         waves[i], mels[i], random.choice(shift_steps)
                     )
-                    prompt_f0[i] *= factor
+                    target_f0[i] *= factor
         wave_lengths = torch.tensor([len(w) for w in waves], device=DEVICE)
         mel_lengths = torch.tensor([m.size(1) for m in mels], device=DEVICE)
         waves = torch.nn.utils.rnn.pad_sequence(waves, batch_first=True)
-        prompt_waves = torch.nn.utils.rnn.pad_sequence(prompt_waves, batch_first=True)
-        mels, prompt_mels = (
+        mels, target_mels = (
             torch.nn.utils.rnn.pad_sequence(
                 [m.T for m in ms], batch_first=True, padding_value=-10
             ).transpose(1, 2)
-            for ms in (mels, prompt_mels)
+            for ms in (mels, target_mels)
         )
 
         with torch.no_grad():
@@ -314,10 +315,7 @@ def main():
 
             waves_16k = torchaudio.functional.resample(waves, sr, 16000)
             lengths_16k = (wave_lengths.float() * 16000 / sr).long()
-            # Prompt content comes from the prompt's own audio, as in the engine.
-            S_ori = content_features(
-                torchaudio.functional.resample(prompt_waves, sr, 16000)
-            )
+            S_ori = content_features(waves_16k)
             S_alt = content_features(
                 torchaudio.functional.resample(converted_22k, 22050, 16000)
             )
@@ -330,17 +328,17 @@ def main():
                 style.append(campplus((feat - feat.mean(dim=0, keepdim=True))[None]))
             style = torch.cat(style)
 
-        ori_cond = model.length_regulator(S_ori, ylens=mel_lengths, f0=prompt_f0)[0]
-        alt_cond = model.length_regulator(S_alt, ylens=mel_lengths, f0=f0)[0]
+        ori_cond = model.length_regulator(S_ori, ylens=mel_lengths, f0=f0)[0]
+        alt_cond = model.length_regulator(S_alt, ylens=mel_lengths, f0=target_f0)[0]
 
         prompt_len = (torch.rand(n, device=DEVICE) * (mel_lengths - 1)).floor().long()
         prompt_len[torch.rand(n, device=DEVICE) < 0.1] = 0
         cond = alt_cond.clone()
         for i in range(n):
             cond[i, : prompt_len[i]] = ori_cond[i, : prompt_len[i]]
-            mels[i, :, : prompt_len[i]] = prompt_mels[i, :, : prompt_len[i]]
+            target_mels[i, :, : prompt_len[i]] = mels[i, :, : prompt_len[i]]
 
-        loss, _ = model.cfm(mels, mel_lengths, prompt_len, cond, style)
+        loss, _ = model.cfm(target_mels, mel_lengths, prompt_len, cond, style)
         return loss
 
     # The loss is a per-clip mean, so weighting each micro-batch by its share of the clips gives

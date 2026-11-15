@@ -14,6 +14,26 @@ f0_max = 1100.0
 f0_min = 50.0
 f0_mel_min = 1127 * np.log(1 + f0_min / 700)
 f0_mel_max = 1127 * np.log(1 + f0_max / 700)
+# A row below this share of the median touched row's norm was hit only once or twice.
+F0_WEAK_SHARE = 0.5
+
+
+def f0_row_hz(n_bins):
+    """Center pitch of each F0 embedding row, inverting f0_to_coarse."""
+    a = (n_bins - 2) / (f0_mel_max - f0_mel_min)
+    mel = (np.arange(n_bins) - 1) / a + f0_mel_min
+    return 700 * (np.exp(mel / 1127) - 1)
+
+
+def f0_rows_trained(weight):
+    """(touched, trained) bool arrays over the pitch rows of an F0 embedding, row 2 on.
+
+    Row 0 is never used and row 1 holds unvoiced frames. Untouched rows are exactly zero.
+    """
+    norm = weight.detach().float().norm(dim=1).cpu().numpy()[2:]
+    touched = norm > 0
+    trained = norm >= F0_WEAK_SHARE * np.median(norm[touched])
+    return touched, trained
 
 
 def f0_to_coarse(f0, f0_bin):
@@ -90,6 +110,24 @@ class InterpolateRegulator(nn.Module):
                         "vector_quantize=True requires 'descript-audio-codec'. Please install it via pip install descript-audio-codec"
                     )
                 self.vq = VectorQuantize(channels, codebook_size, 8)
+
+    @torch.no_grad()
+    def fill_untrained_f0_rows(self):
+        """Replace weak and untouched F0 rows with the trained ones; returns the trained Hz span.
+
+        An untouched row is zero, i.e. no pitch, so those notes fell back to the reference's
+        register. Gaps are interpolated, and past either end the end row holds.
+        """
+        weight = self.f0_embedding.weight
+        trained = f0_rows_trained(weight)[1]
+        rows = np.arange(len(trained))
+        pitch = weight[2:].float().cpu().numpy()
+        filled = np.stack(
+            [np.interp(rows, rows[trained], c[trained]) for c in pitch.T], 1
+        )
+        weight[2:] = torch.from_numpy(filled).to(weight)
+        hz = f0_row_hz(len(weight))[2:][trained]
+        return hz[0], hz[-1]
 
     def forward(self, x, ylens=None, n_quantizers=None, f0=None):
         # apply token drop

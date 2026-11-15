@@ -204,7 +204,11 @@ class RealtimeVCEngine:
                     is_half=False,
                     device=self.device,
                 )
-                print("Pitch conditioning: on (RMVPE)")
+                lo, hi = model.length_regulator.fill_untrained_f0_rows()
+                print(
+                    f"Pitch conditioning: on (RMVPE), trained {lo:.0f}-{hi:.0f} Hz; "
+                    "notes outside that use the nearest trained pitch"
+                )
 
         from audio_modules.campplus.DTDNN import CAMPPlus
 
